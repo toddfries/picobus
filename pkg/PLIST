@@ -1,6 +1,8 @@
 @bin sbin/picobus
+@bin sbin/picobus-pico
 @bin bin/hub-bridge.pl
 @rcscript ${RCDIR}/picobus
+@rcscript ${RCDIR}/picobus_pico
 share/picobus/setup.html
 share/picobus/shared/ORIGIN
 share/picobus/shared/altcha-widget-v1.min.js

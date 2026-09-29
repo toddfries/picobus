@@ -1,0 +1,16 @@
+#!/bin/ksh
+# rc wrapper: env + exec picobus-pico.
+[ -f /etc/picobus.conf ] && . /etc/picobus.conf
+export HUB_SOCK=${HUB_SOCK:-/var/run/picoclaw/hub.sock}
+export PICO_TOKEN_DIR=${PICO_TOKEN_DIR:-${PICOBUS_STATE:-/var/picobus}/secrets/pico}
+if [ -n "${PICO_AGENTS:-}" ]; then
+	export PICO_AGENTS
+else
+	echo "picobus-pico: PICO_AGENTS is empty" >&2
+	exit 1
+fi
+if [ -n "${PICO_IDLE_FLUSH:-}" ]; then
+	export PICO_IDLE_FLUSH
+fi
+LOG=${PICOBUS_STATE:-/var/picobus}/picobus-pico.log
+exec /usr/local/sbin/picobus-pico >>"$LOG" 2>&1

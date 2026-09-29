@@ -1,0 +1,23 @@
+#!/bin/ksh
+# picobus-pico: hub NDJSON <-> PicoClaw native WebSocket translator.
+# Unique argv: /usr/local/sbin/picobus-pico (perl).
+
+daemon="/usr/local/libexec/picobus-pico"
+daemon_user="_picobus"
+daemon_timeout=10
+
+. /etc/rc.d/rc.subr
+
+pexp="/usr/bin/perl /usr/local/sbin/picobus-pico"
+
+rc_bg=YES
+rc_reload=NO
+
+rc_pre() {
+	[ -x /usr/local/sbin/picobus-pico ]
+	[ -x "${daemon}" ]
+	[ -S /var/run/picoclaw/hub.sock ]
+	[ -n "${PICO_AGENTS:-}" ] || [ -f /etc/picobus.conf ]
+}
+
+rc_cmd $1

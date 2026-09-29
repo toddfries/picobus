@@ -2,6 +2,9 @@
 # rc wrapper: env + exec picobus (the process rcctl tracks).
 [ -f /etc/picobus.conf ] && . /etc/picobus.conf
 export HUB_SOCK=${HUB_SOCK:-/var/run/picoclaw/hub.sock}
+if [ -n "${HUB_GROUP:-}" ]; then
+	export HUB_GROUP
+fi
 export FCGI_SOCK=${FCGI_SOCK:-/var/www/run/picoclaw/fcgi.sock}
 export PICOBUS_STATE=${PICOBUS_STATE:-/var/picobus}
 export HUB_LOG=${HUB_LOG:-$PICOBUS_STATE/hub-events.ndjson}

@@ -1,0 +1,273 @@
+#!/usr/bin/perl
+# picobus-pico — translate picobus hub NDJSON <-> PicoClaw native WebSocket.
+#
+# PicoClaw never speaks hub NDJSON. talkd, the web UI, and hubctl stay on
+# hub.sock. This process is the only thing that holds a Pico WS.
+#
+# Env:
+#   HUB_SOCK        UNIX hub (default /var/run/picoclaw/hub.sock)
+#   PICO_AGENTS     comma list of id=host:port (required)
+#   PICO_TOKEN_DIR  directory of files named by agent id (required)
+#   PICO_IDLE_FLUSH seconds after last non-thought content (default 8)
+#
+# Requires Mojolicious (pkg_add p5-Mojolicious). Do not hand-roll WS frames.
+
+use strict;
+use warnings;
+use JSON::PP qw(encode_json decode_json);
+use Mojo::IOLoop;
+use Mojo::UserAgent;
+
+my $HUB_SOCK   = $ENV{HUB_SOCK}      // '/var/run/picoclaw/hub.sock';
+my $TOKEN_DIR  = $ENV{PICO_TOKEN_DIR} // '';
+my $IDLE_FLUSH = $ENV{PICO_IDLE_FLUSH} // 8;
+my $SPEC       = $ENV{PICO_AGENTS}    // '';
+
+$| = 1;
+
+sub logmsg {
+    print STDERR "[picobus-pico] @_\n";
+}
+
+die "PICO_AGENTS required (id=host:port,...)\n" unless length $SPEC;
+die "PICO_TOKEN_DIR required\n" unless length $TOKEN_DIR && -d $TOKEN_DIR;
+
+my @agents;
+for my $part (split /,/, $SPEC) {
+    $part =~ s/^\s+|\s+$//g;
+    next unless length $part;
+    if ($part =~ /^([A-Za-z0-9_.-]+)=([^:]+):(\d+)$/) {
+        push @agents, { id => $1, host => $2, port => 0 + $3 };
+    }
+    else {
+        die "bad PICO_AGENTS entry '$part' (want id=host:port)\n";
+    }
+}
+die "PICO_AGENTS parsed empty\n" unless @agents;
+
+for my $a (@agents) {
+    my $p = "$TOKEN_DIR/$a->{id}";
+    open my $fh, '<', $p or die "token $p: $!\n";
+    my $tok = <$fh> // '';
+    close $fh;
+    $tok =~ s/\s+//g;
+    die "token $p: empty\n" unless length $tok;
+    $a->{token}      = $tok;
+    $a->{q}          = {};      # sid => [queued pico frames]
+    $a->{ws}         = {};      # sid => Mojo::Transaction::WebSocket
+    $a->{ws_pending} = {};
+    $a->{sessions}   = {};      # sid => { from, content, flushed }
+    $a->{hbuf}       = '';
+}
+
+my $ua = Mojo::UserAgent->new;
+$ua->connect_timeout(10);
+$ua->request_timeout(0);
+$ua->inactivity_timeout(90);
+$ua->max_redirects(0);
+
+sub sid_for {
+    my ($from) = @_;
+    $from = 'anon' unless defined $from && $from ne '';
+    $from =~ s/[^A-Za-z0-9_.-]+/_/g;
+    return "pb.$from";
+}
+
+sub thoughtish {
+    my ($pl) = @_;
+    return 1 unless $pl && ref $pl eq 'HASH';
+    return 1 if $pl->{placeholder};
+    my $kind = lc($pl->{kind} // '');
+    return 1 if $kind eq 'thought' || $kind eq 'tool_calls';
+    return 1 if $pl->{thought};
+    return 0;
+}
+
+sub hub_write {
+    my ($agent, $obj) = @_;
+    my $stream = $agent->{hub} or return;
+    eval { $stream->write(encode_json($obj) . "\n") };
+}
+
+sub pico_send {
+    my ($agent, $sid, $hash) = @_;
+    if (my $tx = $agent->{ws}{$sid}) {
+        $tx->send({ json => $hash });
+        return;
+    }
+    my $q = $agent->{q}{$sid} ||= [];
+    push @$q, $hash;
+    shift @$q while @$q > 20;
+    connect_ws($agent, $sid);
+}
+
+sub flush_session {
+    my ($agent, $sid, $why) = @_;
+    my $st = $agent->{sessions}{$sid} or return;
+    my $content = $st->{content} // '';
+    return unless length $content;
+    return if ($st->{flushed} // '') eq $content;
+    my $to = $st->{from} // '';
+    return unless length $to;
+    hub_write($agent, {
+        type    => 'message',
+        from    => $agent->{id},
+        to      => $to,
+        content => $content,
+    });
+    $st->{flushed} = $content;
+    logmsg("$agent->{id} reply -> $to ($why) bytes=" . length($content));
+}
+
+sub handle_pico {
+    my ($agent, $msg) = @_;
+    return unless $msg && ref $msg eq 'HASH';
+    my $type = $msg->{type} // '';
+    my $sid  = $msg->{session_id} // '';
+    if ($type eq 'error') {
+        my $pl = $msg->{payload} || {};
+        logmsg("$agent->{id} pico error: " . ($pl->{message} // $pl->{code} // '?'));
+        return;
+    }
+    if ($type eq 'typing.stop') {
+        flush_session($agent, $sid, 'typing.stop') if $sid;
+        return;
+    }
+    return unless $type eq 'message.create' || $type eq 'message.update';
+    my $pl = $msg->{payload} || {};
+    return if thoughtish($pl);
+    my $content = $pl->{content} // '';
+    return unless length $content;
+    return unless $sid;
+    my $st = $agent->{sessions}{$sid} ||= {};
+    $st->{content} = $content;    # Pico streams full accumulated text
+    if ($agent->{idle}{$sid}) {
+        Mojo::IOLoop->remove($agent->{idle}{$sid});
+    }
+    $agent->{idle}{$sid} = Mojo::IOLoop->timer($IDLE_FLUSH => sub {
+        delete $agent->{idle}{$sid};
+        flush_session($agent, $sid, 'idle');
+    });
+}
+
+sub handle_hub_line {
+    my ($agent, $line) = @_;
+    return unless length $line;
+    my $obj = eval { decode_json($line) };
+    return unless $obj && ref $obj eq 'HASH';
+    my $type = $obj->{type} // '';
+    return if $type eq 'register' || $type eq 'disconnect' || $type eq 'ack';
+    if ($type eq 'error') {
+        logmsg("$agent->{id} hub error: " . ($obj->{msg} // '?'));
+        return;
+    }
+    return unless $type eq 'message';
+    my $from = $obj->{from} // '';
+    return if $from eq '' || $from eq $agent->{id};
+    my $content = $obj->{content} // $obj->{body} // '';
+    return unless length $content;
+    my $sid = sid_for($from);
+    $agent->{sessions}{$sid}{from} = $from;
+    # Pico binds the WS connection to ?session_id=; replies go only to
+    # connections in that session. Message session_id must match.
+    pico_send($agent, $sid, {
+        type       => 'message.send',
+        id         => 'pb-' . $agent->{id} . '-' . ++$agent->{n},
+        session_id => $sid,
+        payload    => { content => "[bus from=$from] $content" },
+    });
+    logmsg("$agent->{id} inject from=$from sid=$sid bytes=" . length($content));
+}
+
+sub connect_hub {
+    my ($agent) = @_;
+    if ($agent->{hub}) {
+        eval { $agent->{hub}->close };
+        $agent->{hub} = undef;
+    }
+    unless (-S $HUB_SOCK) {
+        Mojo::IOLoop->timer(1 => sub { connect_hub($agent) });
+        return;
+    }
+    Mojo::IOLoop->client(path => $HUB_SOCK => sub {
+        my ($loop, $err, $stream) = @_;
+        if ($err || !$stream) {
+            logmsg("$agent->{id} hub connect: " . ($err // 'no stream'));
+            Mojo::IOLoop->timer(2 => sub { connect_hub($agent) });
+            return;
+        }
+        $agent->{hub}  = $stream;
+        $agent->{hbuf} = '';
+        $stream->timeout(0);
+        $stream->write(encode_json({ type => 'register', id => $agent->{id} }) . "\n");
+        $stream->on(read => sub {
+            my ($stream, $bytes) = @_;
+            $agent->{hbuf} .= $bytes;
+            while ($agent->{hbuf} =~ s/^(.*?)\n//) {
+                handle_hub_line($agent, $1);
+            }
+        });
+        $stream->on(close => sub {
+            logmsg("$agent->{id} hub closed");
+            $agent->{hub} = undef;
+            Mojo::IOLoop->timer(1 => sub { connect_hub($agent) });
+        });
+        $stream->on(error => sub {
+            my ($stream, $err) = @_;
+            logmsg("$agent->{id} hub error $err");
+        });
+        logmsg("$agent->{id} registered on hub");
+    });
+}
+
+sub connect_ws {
+    my ($agent, $sid) = @_;
+    $sid ||= 'pb.' . $agent->{id};
+    return if $agent->{ws}{$sid} || $agent->{ws_pending}{$sid};
+    $agent->{ws_pending}{$sid} = 1;
+    my $url = "ws://$agent->{host}:$agent->{port}/pico/ws?session_id=$sid";
+    $ua->websocket(
+        $url => { Authorization => "Bearer $agent->{token}" } => sub {
+            my ($ua, $tx) = @_;
+            delete $agent->{ws_pending}{$sid};
+            unless ($tx->is_websocket) {
+                my $code = $tx->res->code // 0;
+                logmsg("$agent->{id} ws upgrade failed sid=$sid code=$code");
+                Mojo::IOLoop->timer(3 => sub { connect_ws($agent, $sid) });
+                return;
+            }
+            $agent->{ws}{$sid} = $tx;
+            logmsg("$agent->{id} pico ws up sid=$sid");
+            while (my $hash = shift @{ $agent->{q}{$sid} || [] }) {
+                $tx->send({ json => $hash });
+            }
+            $tx->on(json => sub {
+                my ($tx, $hash) = @_;
+                $hash->{session_id} ||= $sid if $hash && ref $hash eq 'HASH';
+                handle_pico($agent, $hash);
+            });
+            $tx->on(finish => sub {
+                my ($tx, $code) = @_;
+                logmsg("$agent->{id} ws finished sid=$sid code=" . ($code // ''));
+                delete $agent->{ws}{$sid};
+                if ($agent->{ping}{$sid}) {
+                    Mojo::IOLoop->remove($agent->{ping}{$sid});
+                    delete $agent->{ping}{$sid};
+                }
+                Mojo::IOLoop->timer(1 => sub { connect_ws($agent, $sid) });
+            });
+            $agent->{ping}{$sid} = Mojo::IOLoop->recurring(25 => sub {
+                my $w = $agent->{ws}{$sid} or return;
+                $w->send({ json => { type => 'ping', id => 'pb-ping' } });
+            });
+        }
+    );
+}
+
+for my $a (@agents) {
+    connect_hub($a);
+    connect_ws($a, 'pb.' . $a->{id});
+}
+
+logmsg("watching " . join(',', map { $_->{id} } @agents));
+Mojo::IOLoop->start;

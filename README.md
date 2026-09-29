@@ -22,12 +22,17 @@ rcctl start picobus
 An agent joins by connecting to the hub socket and sending one JSON
 line: `{"type":"register","id":"NAME"}`.
 
-For a live PicoClaw gateway, **do not use inbox files**. The native
-inject path is `ws://127.0.0.1:<port>/pico/ws`. `bin/picobus-pico`
-holds that WebSocket (Mojolicious, `pkg_add p5-Mojolicious`) and
-translates hub NDJSON to Pico `message.send` / `message.create`.
-PicoClaw never speaks hub NDJSON; talkd and the web UI stay on the hub
-socket.
+A live PicoClaw gateway does **not** join that way. It already serves
+`ws://127.0.0.1:<port>/pico/ws`. `bin/picobus-pico` (Mojolicious,
+`pkg_add p5-Mojolicious`) holds that WebSocket — one connection per
+hub sender, `?session_id=` matching the Pico chat — and translates hub
+NDJSON to Pico `message.send` / `message.create`. PicoClaw never
+speaks hub NDJSON. Talkd, the web UI, and `hubctl` stay on the hub
+socket and never speak Pico.
+
+Do **not** give a gateway `hub-inbox.ndjson` / `hub-outbox.ndjson`.
+That mailbox makes the model spend tool turns (`echo >> file`, `cat`
+polls) to talk to its neighbours. The Pico path *is* the turn.
 
 ```sh
 # /etc/picobus.conf
@@ -40,16 +45,9 @@ rcctl start picobus picobus_pico
 
 Token files are `$PICO_TOKEN_DIR/<id>` (one line, mode 0640). Put the
 same value under `channel_list.pico.settings.token` in that instance's
-`.security.yml` — never append YAML at EOF.
-
-`bin/hub-bridge.pl` is a file mailbox for processes that cannot hold a
-Pico socket. Prefer `picobus-pico` when the gateway already has
-`channel_list.pico` enabled.
-
-```sh
-HUB_SOCK=/var/run/picoclaw/hub.sock AGENT_ID=NAME \
-  perl hub-bridge.pl inbox.ndjson outbox.ndjson
-```
+`.security.yml` — never append YAML at EOF. Handshake `?session_id=`
+must match the `session_id` on `message.send` or Pico replies
+`no active connections for session`.
 
 Hub socket mode is 0660. Set `HUB_GROUP` so every client user is in
 that group; do not chmod the socket 0666.

@@ -1,16 +1,10 @@
 #!/usr/bin/perl
-# hub-bridge.pl — a tiny bridge that lets a picoclaw agent (or any process
-# that can run shell commands) participate in the hub network.
+# hub-bridge.pl — RETIRED for PicoClaw gateways.
+# File inbox/outbox makes the model spend tool turns to talk on the bus.
+# Use picobus-pico (native /pico/ws) instead.
 #
+# Kept only for a non-gateway process that truly cannot hold a Pico socket.
 # usage: HUB_SOCK=... AGENT_ID=name perl hub-bridge.pl <inbox-file> <outbox-file>
-#
-# Protocol:
-#   - Lines written to <outbox-file> (echo "..." >> outbox) are sent to the
-#     hub as messages from AGENT_ID.
-#   - Messages from other agents are appended to <inbox-file>.
-#
-# This gives picoclaw agents file-based access to the hub: the agent writes
-# to its outbox with a shell command and reads its inbox for replies.
 
 use strict;
 use warnings;

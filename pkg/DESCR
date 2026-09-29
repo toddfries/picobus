@@ -2,8 +2,9 @@ picobus is the hub for picoclaw agents: a UNIX-socket bus, a FastCGI
 web handler, and the web UI, including first-run signup.
 
 Agents join by connecting to /var/run/picoclaw/hub.sock and sending a
-register message. State lives in /var/picobus. picobus-pico (optional)
-holds a native Pico WebSocket to each gateway and translates hub NDJSON
-to message.send / message.create. PicoClaw never speaks hub NDJSON.
+register message. State lives in /var/picobus. picobus-pico holds a
+native Pico WebSocket to each gateway and translates hub NDJSON to
+message.send / message.create. PicoClaw never speaks hub NDJSON and
+must not use workspace inbox/outbox files.
 
 Another system can run this without becoming Daemon Crew.

@@ -1,0 +1,21 @@
+#!/bin/ksh
+# picobus: hub socket, FastCGI, and the web UI.
+# Socket stays /var/run/picoclaw/hub.sock so picoclaw agents can find it.
+
+daemon="/usr/local/libexec/picobus"
+daemon_user="root"
+
+. /etc/rc.d/rc.subr
+
+# The wrapper execs the perl hub, so the process is not libexec/picobus.
+pexp="/usr/bin/perl /usr/local/sbin/picobus"
+
+rc_bg=YES
+rc_reload=NO
+
+rc_pre() {
+	mkdir -p /var/run/picoclaw /var/www/run/picoclaw /var/picobus
+	[ -x /usr/local/sbin/picobus ]
+}
+
+rc_cmd $1

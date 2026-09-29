@@ -1,0 +1,2040 @@
+#!/usr/bin/perl
+
+# Copyright (c) 2026 Todd T. Fries <todd@fries.net>
+#
+# Permission to use, copy, modify, and distribute this software for any
+# purpose with or without fee is hereby granted, provided that the above
+# copyright notice and this permission notice appear in all copies.
+#
+# THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
+# WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
+# MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR
+# ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
+# WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN
+# ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
+# OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
+
+# picobus — hub socket, NDJSON bus, FastCGI, and the web UI, including
+# first-run signup. Agents join by connecting and sending a register
+# message. Roster and Love Equation scoring are not this program.
+
+use strict;
+use warnings;
+use IO::Socket::UNIX;
+use IO::Select;
+use JSON::PP qw(encode_json decode_json);
+use FCGI;
+use POSIX qw(strftime);
+use Errno qw(EAGAIN EWOULDBLOCK);
+use Fcntl qw(F_GETFL F_SETFL O_NONBLOCK);
+use FindBin;
+use Digest::SHA qw(sha256_hex hmac_sha256_hex);
+use MIME::Base64 qw(decode_base64);
+$| = 1;
+
+# ---------- config (env overrides; rc wrapper sets the service defaults) ----------
+my $HUB_SOCK   = $ENV{HUB_SOCK}  // '/var/run/picoclaw/hub.sock';
+my $FCGI_SOCK  = $ENV{FCGI_SOCK} // '/var/www/run/picoclaw/fcgi.sock';
+my $MAX_LOG    = 50000;        # server history; the browser only gets one page
+my $MAX_UPLOAD = 8 * 1024 * 1024;
+my $SELECT_TO  = 0.5;          # seconds; keeps CPU near zero
+my $UMASK      = 0117;         # socket perms 0660-ish after umask
+my $STATE_DIR  = $ENV{PICOBUS_STATE} // '/var/picobus';
+my $HUB_LOG    = $ENV{HUB_LOG}  // "$STATE_DIR/hub-events.ndjson";
+my $CHAT_LOG     = $ENV{CHAT_LOG};
+my $FILE_DIR     = $ENV{FILE_DIR};
+my $SETUP_FILE   = $ENV{SETUP_FILE};
+my $SECRETS_DIR  = $ENV{SECRETS_DIR};
+my $SHARE_DIR    = $ENV{SHARE_DIR};
+my $PICO_HOME    = $ENV{PICOCLAW_HOME};
+my $PRODUCT       = $ENV{PICOBUS_PRODUCT} // 'picobus';
+my $COOKIE_PREFIX = $ENV{PICOBUS_COOKIE}  // 'PICOBUS';
+# -----------------------------------------
+
+umask $UMASK;
+unlink $HUB_SOCK if -e $HUB_SOCK;
+
+my $hub = IO::Socket::UNIX->new(
+    Local  => $HUB_SOCK,
+    Type   => SOCK_STREAM,
+    Listen => 32,
+) or die "hub listen: $!\n";
+$hub->blocking(0);
+chmod 0660, $HUB_SOCK;
+
+# OpenBSD: lock filesystem + promises after listen fd exists.
+# HUB_NOSANDBOX=1 skips (debug only). Non-OpenBSD: no-op.
+sub _parent_dir {
+    my ($p) = @_;
+    return unless defined $p && length $p;
+    return $p if $p !~ m{/};
+    $p =~ s{/[^/]+$}{};
+    return length($p) ? $p : '/';
+}
+
+sub hub_sandbox {
+    return if ($ENV{HUB_NOSANDBOX} // '') eq '1';
+    return unless $^O eq 'openbsd';
+    eval {
+        require OpenBSD::Pledge;
+        require OpenBSD::Unveil;
+        OpenBSD::Pledge->import('pledge');
+        OpenBSD::Unveil->import('unveil');
+        1;
+    } or return;
+    my %dir;
+    for my $p ($HUB_SOCK, $HUB_LOG, $FCGI_SOCK, $CHAT_LOG, $FILE_DIR, $SETUP_FILE, $SECRETS_DIR) {
+        next unless defined $p && length $p;
+        my $d = _parent_dir($p);
+        $dir{$d} = 'rwc' if defined $d;
+        $dir{$p} = 'rwc' if -d $p;
+    }
+    $dir{$FindBin::Bin} = 'rwc' if exists $dir{$FindBin::Bin};
+    $dir{$FindBin::Bin} //= 'r';
+    for my $p ($SHARE_DIR, '/usr/local/share/picobus') {
+        next unless defined $p && length $p && -d $p;
+        $dir{$p} = 'r';
+        my $sh = "$p/shared";
+        $dir{$sh} = 'r' if -d $sh;
+    }
+    if ($PICO_HOME) {
+        mkdir $PICO_HOME, 0700 unless -d $PICO_HOME;
+        $dir{$PICO_HOME} = 'rwc';
+    }
+    for my $d (sort keys %dir) {
+        unveil($d, $dir{$d}) or die "unveil $d: $!\n";
+    }
+    unveil() or die "unveil lock: $!\n";
+    # fattr: chmod 0600 on secrets. error: unveil/pledge misses return EPERM
+    # instead of killing the daemon (that was the Continue HTML-500).
+    pledge(qw(stdio rpath wpath cpath unix fattr error)) or die "pledge: $!\n";
+}
+
+# Chat transcript + local file blobs (MinIO/S3 later; same URL shape).
+$CHAT_LOG    //= (_parent_dir($HUB_LOG) || '.') . '/chat.ndjson';
+$FILE_DIR    //= (_parent_dir($HUB_LOG) || '.') . '/files';
+$SETUP_FILE  //= (_parent_dir($HUB_LOG) || '.') . '/setup.json';
+$SECRETS_DIR //= (_parent_dir($HUB_LOG) || '.') . '/secrets';
+if (!defined $SHARE_DIR || $SHARE_DIR eq '') {
+    my $dev = "$FindBin::Bin/../share";
+    $SHARE_DIR = (-d $dev) ? $dev : '/usr/local/share/picobus';
+}
+{
+    my $state = _parent_dir($HUB_LOG);
+    mkdir $state, 0755 if $state && !-d $state;
+}
+$PICO_HOME //= ($ENV{HOME} || '/root') . '/.picoclaw';
+mkdir $FILE_DIR, 0755 unless -d $FILE_DIR;
+mkdir $SECRETS_DIR, 0700 unless -d $SECRETS_DIR;
+mkdir $PICO_HOME, 0700 unless -d $PICO_HOME;
+
+my $sel = IO::Select->new($hub);
+
+# agent_id => { sock => $fh, buf => '' }
+my %agents;
+# reverse: fileno => agent_id
+my %fd2id;
+# channel_id => { id, kind => 'dm'|'group'|'system', name, members => [] }
+my %channels;
+my $HUB_BROADCAST = ($ENV{HUB_BROADCAST} // '') eq '1';
+$channels{all} = {
+    id      => 'all',
+    kind    => 'system',
+    name    => 'system',
+    members => [],
+};
+my @log;   # chat history (capped); browser paginates, does not hold all of it
+
+sub load_chat_log {
+    return unless $CHAT_LOG && -f $CHAT_LOG;
+    open my $fh, '<', $CHAT_LOG or return;
+    while (my $line = <$fh>) {
+        chomp $line;
+        next unless length $line;
+        my $obj = eval { decode_json($line) };
+        next unless $obj && ref $obj eq 'HASH';
+        push @log, $obj;
+    }
+    close $fh;
+    shift @log while @log > $MAX_LOG;
+}
+
+load_chat_log();
+
+sub append_ndjson {
+    my ($path, $obj) = @_;
+    return unless $path;
+    open my $fh, '>>', $path or return;
+    print $fh encode_json($obj), "\n";
+    close $fh;
+}
+
+sub log_msg {
+    my ($obj) = @_;
+    $obj->{ts} //= strftime("%Y-%m-%dT%H:%M:%SZ", gmtime);
+    push @log, $obj;
+    shift @log while @log > $MAX_LOG;
+    append_ndjson($CHAT_LOG, $obj);
+    append_ndjson($HUB_LOG, $obj) if !$CHAT_LOG || $HUB_LOG ne $CHAT_LOG;
+}
+
+sub send_json {
+    my ($fh, $obj) = @_;
+    my $line = encode_json($obj) . "\n";
+    # non-blocking best-effort; real production would queue
+    syswrite($fh, $line) or return;
+}
+
+sub fanout_to_members {
+    my ($obj, $members) = @_;
+    my $from = $obj->{from} // '';
+    for my $id (@$members) {
+        next if $id eq '' || $id eq 'human' || $id eq $from;
+        next unless $agents{$id} && $agents{$id}{sock};
+        send_json($agents{$id}{sock}, $obj);
+    }
+}
+
+sub ensure_dm_channel {
+    my ($id) = @_;
+    return unless defined $id && $id ne '' && $id ne 'human' && $id ne 'all';
+    $channels{$id} ||= {
+        id      => $id,
+        kind    => 'dm',
+        name    => $id,
+        members => [ 'human', $id ],
+    };
+}
+
+sub ensure_group_channel {
+    my ($id, $name, $members) = @_;
+    $id =~ s/[^\w:.\-]+/_/g;
+    $id = "g:$id" unless $id =~ /^g:/;
+    my @m = ('human');
+    my %seen = ( human => 1 );
+    for my $x (@{ $members || [] }) {
+        next unless defined $x && $x ne '';
+        next if $seen{$x}++;
+        push @m, $x;
+    }
+    $channels{$id} = {
+        id      => $id,
+        kind    => 'group',
+        name    => ($name || $id),
+        members => \@m,
+    };
+    return $channels{$id};
+}
+
+sub refresh_team_group {
+    my @m = ('human');
+    my %seen = ( human => 1 );
+    for my $id (keys %agents) {
+        next if $id =~ /^anon-/ || $id eq '';
+        next if $seen{$id}++;
+        push @m, $id;
+    }
+    ensure_group_channel('g:team', 'team', \@m);
+}
+
+sub route_message {
+    my ($obj) = @_;
+    $obj->{to} = normalize_to($obj->{to});
+    log_msg($obj);
+
+    my $to = $obj->{to} // '';
+    if (is_broadcast_to($to) || $to eq 'all') {
+        # System log only. Work is never assigned via to=all unless lab flag.
+        if ($HUB_BROADCAST) {
+            fanout_to_members($obj, [ keys %agents ]);
+        }
+        return;
+    }
+    if (my $ch = $channels{$to}) {
+        fanout_to_members($obj, $ch->{members} || []);
+        return;
+    }
+    if (my $a = $agents{$to}) {
+        ensure_dm_channel($to);
+        send_json($a->{sock}, $obj);
+        return;
+    }
+    send_json($agents{$obj->{from}}{sock}, {
+        type => 'error', msg => "unknown target $to"
+    }) if $obj->{from} && $agents{$obj->{from}};
+}
+
+sub handle_agent_line {
+    my ($id, $line) = @_;
+    my $obj = eval { decode_json($line) };
+    return unless $obj && ref $obj eq 'HASH' && $obj->{type};
+
+    if ($obj->{type} eq 'register') {
+        # already registered under this id? replace
+        if (exists $agents{$id} && $agents{$id}{sock} ne $agents{$obj->{id}}{sock}) {
+            # ignore
+        }
+        $obj->{id} //= $id;
+        log_msg({ type => 'register', id => $obj->{id} });
+        ensure_dm_channel($obj->{id});
+        refresh_team_group();
+        return;
+    }
+    if ($obj->{type} eq 'channel') {
+        my $op = $obj->{op} // 'create';
+        if ($op eq 'create') {
+            my $ch = ensure_group_channel(
+                $obj->{id} || ('g-' . int(time())),
+                $obj->{name},
+                $obj->{members} || [],
+            );
+            send_json($agents{$id}{sock}, { type => 'ack', channel => $ch->{id} })
+                if $agents{$id};
+        }
+        return;
+    }
+    $obj->{from} //= $id;
+    route_message($obj);
+}
+
+sub close_agent {
+    my ($fh) = @_;
+    my $fn = fileno($fh);
+    my $id = delete $fd2id{$fn};
+    if ($id) {
+        delete $agents{$id};
+        log_msg({ type => 'disconnect', id => $id });
+    }
+    $sel->remove($fh);
+    close $fh;
+}
+
+sub setup_secret {
+    mkdir $SECRETS_DIR, 0700 unless -d $SECRETS_DIR;
+    my $p = "$SECRETS_DIR/session.key";
+    if (!-f $p) {
+        my $k = sprintf('%08x%08x%08x%08x', map { int(rand(2**32)) } 1 .. 4);
+        open my $fh, '>', $p or return 'dev-setup-key';
+        print $fh $k;
+        close $fh;
+        chmod 0600, $p;
+    }
+    open my $fh, '<', $p or return 'dev-setup-key';
+    my $k = <$fh>;
+    close $fh;
+    chomp $k;
+    return $k || 'dev-setup-key';
+}
+
+sub load_setup {
+    return unless $SETUP_FILE && -f $SETUP_FILE;
+    open my $fh, '<', $SETUP_FILE or return;
+    local $/;
+    return eval { decode_json(<$fh>) };
+}
+
+sub setup_complete {
+    my $s = load_setup();
+    return $s && $s->{complete};
+}
+
+sub llm_configured {
+    my $s = load_setup() || {};
+    return 1 if $s->{llm_key};
+    return 1 if -f "$SECRETS_DIR/security.yml";
+    return 1 if -f '/root/.picoclaw/.security.yml';
+    return 0;
+}
+
+sub bcrypt_hash {
+    my ($pw) = @_;
+    my @c = ('.', '/', 0 .. 9, 'A' .. 'Z', 'a' .. 'z');
+    my $salt = join '', map { $c[ int rand @c ] } 1 .. 22;
+    return crypt($pw, '$2b$10$' . $salt);
+}
+
+sub bcrypt_ok {
+    my ($pw, $hash) = @_;
+    return 0 unless $hash && $pw;
+    my $c = crypt($pw, $hash);
+    return defined $c && $c eq $hash;
+}
+
+# ALTCHA-compatible PoW (same protocol as zhc-altcha.php / altcha.org).
+sub pow_challenge {
+    my $max  = 100000;
+    my $n    = 1 + int(rand($max));
+    my $salt = sprintf('%08x%08x', time(), int(rand(2**32)));
+    my $challenge = sha256_hex($salt . $n);
+    my $sig       = hmac_sha256_hex($challenge, setup_secret());
+    return {
+        algorithm => 'SHA-256',
+        challenge => $challenge,
+        salt      => $salt,
+        signature => $sig,
+        maxnumber => $max,
+    };
+}
+
+sub pow_ok {
+    my ($challenge, $salt, $number, $sig) = @_;
+    return 0 unless $challenge && $salt && defined $number && $sig;
+    return 0 unless hmac_sha256_hex($challenge, setup_secret()) eq $sig;
+    return sha256_hex($salt . $number) eq $challenge;
+}
+
+# Official ALTCHA widget posts `altcha` as base64(JSON{algorithm,challenge,number,salt,signature}).
+sub parse_altcha {
+    my ($obj) = @_;
+    $obj ||= {};
+    my ($ch, $salt, $n, $sig) = @$obj{qw(challenge salt number signature)};
+    my $raw = $obj->{altcha} // '';
+    if (length $raw) {
+        my $txt = $raw;
+        if ($txt !~ /^\s*\{/) {
+            $txt = eval { decode_base64($raw) } // '';
+        }
+        if ($txt =~ /^\s*\{/) {
+            my $p = eval { decode_json($txt) } || {};
+            $ch   = $p->{challenge} // $ch;
+            $salt = $p->{salt}      // $salt;
+            $n    = $p->{number}    // $n;
+            $sig  = $p->{signature} // $sig;
+        }
+    }
+    return ($ch, $salt, $n, $sig);
+}
+
+sub http_date {
+    return strftime('%a, %d %b %Y %H:%M:%S GMT', gmtime($_[0] || time));
+}
+
+sub share_file {
+    my ($name) = @_;
+    return unless $name && $name =~ /^[A-Za-z0-9._-]+$/;
+    for my $root ($SHARE_DIR, '/usr/local/share/picobus') {
+        next unless $root && length $root;
+        my $p = "$root/shared/$name";
+        return $p if -f $p;
+    }
+    return;
+}
+
+sub write_llm_secrets {
+    my ($base, $key, $mgmt) = @_;
+    mkdir $SECRETS_DIR, 0700 unless -d $SECRETS_DIR;
+    $base ||= 'https://openrouter.ai/api/v1';
+    $base =~ s{/+$}{};
+    my $alias = $ENV{PICOBUS_LLM_ALIAS} // 'default';
+    if (open my $fh, '>', "$SECRETS_DIR/security.yml") {
+        print $fh "model_list:\n  $alias:\n    api_keys:\n      - \"$key\"\n";
+        print $fh "  openrouter-mgmt:\n    api_keys:\n      - \"$mgmt\"\n" if $mgmt;
+        close $fh;
+        chmod 0600, "$SECRETS_DIR/security.yml";
+    }
+    mkdir $PICO_HOME, 0700 unless -d $PICO_HOME;
+    my $link = "$PICO_HOME/.security.yml";
+    unlink $link if -l $link || -f $link;
+    symlink "$SECRETS_DIR/security.yml", $link;
+    my $model = 'nvidia/nemotron-3-ultra-550b-a55b:free';
+    if (open my $cf, '>', "$PICO_HOME/config.json") {
+        print $cf encode_json({
+            agents => {
+                defaults => {
+                    model_name             => $alias,
+                    workspace              => "$PICO_HOME/workspace",
+                    restrict_to_workspace  => JSON::PP::true,
+                    max_tokens             => 8192,
+                },
+            },
+            model_list => [{
+                name     => $alias,
+                model    => $model,
+                api_base => $base,
+            }],
+        });
+        close $cf;
+    }
+    if (open my $mf, '>', "$SECRETS_DIR/llm.json") {
+        print $mf encode_json({
+            api_base     => $base,
+            shared_key   => $mgmt ? JSON::PP::false : JSON::PP::true,
+            has_mgmt_key => $mgmt ? JSON::PP::true : JSON::PP::false,
+        });
+        close $mf;
+        chmod 0600, "$SECRETS_DIR/llm.json";
+    }
+}
+
+sub save_setup {
+    my ($obj) = @_;
+    mkdir _parent_dir($SETUP_FILE), 0755;
+    open my $fh, '>', $SETUP_FILE or return 0;
+    print $fh encode_json($obj);
+    close $fh;
+    chmod 0600, $SETUP_FILE;
+    return 1;
+}
+
+# ---------- FastCGI: Discord-alike UI + JSON API ----------
+# POST: read CONTENT_LENGTH + STDIN (urlencoded forms AND JSON /api/send).
+# QUERY_STRING still works for GET inject / ?format=json.
+
+sub parse_urlencoded {
+    my ($s) = @_;
+    my %q;
+    return \%q unless defined $s && length $s;
+    for my $kv (split /[&;]/, $s) {
+        next unless length $kv;
+        my ($k, $v) = split /=/, $kv, 2;
+        $v = '' unless defined $v;
+        for ($k, $v) {
+            tr/+/ /;
+            s/%([0-9A-Fa-f]{2})/chr(hex($1))/ge;
+        }
+        $q{$k} = $v;
+    }
+    return \%q;
+}
+
+sub fcgi_path {
+    my $uri = $ENV{REQUEST_URI} // '';
+    $uri =~ s/\?.*//s;
+    my $pi = $ENV{PATH_INFO}   // '';
+    my $sn = $ENV{SCRIPT_NAME} // '';
+    return $uri if $uri =~ m{/api/};
+    return $pi  if $pi  =~ m{/api/};
+    return $sn  if $sn  =~ m{/api/};
+    return $uri if length $uri;
+    return $pi  if length $pi;
+    return length $sn ? $sn : '/';
+}
+
+# When set, handle_fcgi writes CGI bytes here instead of tied FCGI STDOUT.
+my ($FCGI_BUF, $FCGI_STDIN_BUF);
+
+sub fcgi_read_body {
+    my ($cap) = @_;
+    $cap ||= 65536;
+    if (defined $FCGI_STDIN_BUF) {
+        my $b = $FCGI_STDIN_BUF;
+        $FCGI_STDIN_BUF = '';
+        return $b;
+    }
+    my $len = $ENV{CONTENT_LENGTH};
+    return '' unless defined $len && $len =~ /^\d+$/ && $len > 0;
+    my $want = $len > $cap ? $cap : $len;
+    my $buf = '';
+    while (length($buf) < $want) {
+        my $n = read(STDIN, my $chunk, $want - length($buf));
+        last if !defined $n || $n == 0;
+        $buf .= $chunk;
+    }
+    return $buf;
+}
+
+sub cgi_out {
+    my ($headers, $body) = @_;
+    $body //= '';
+    if (defined $FCGI_BUF) {
+        $FCGI_BUF .= $headers . $body;
+        return;
+    }
+    print $headers, $body;
+}
+
+sub fcgi_print {
+    my ($ctype, $body, $status) = @_;
+    $status //= '200 OK';
+    cgi_out(
+        "Status: $status\r\nCache-Control: no-store\r\nContent-Type: $ctype\r\n\r\n",
+        $body
+    );
+}
+
+sub json_out {
+    my ($code, $obj, $hdr) = @_;
+    $hdr ||= {};
+    my %st = (
+        200 => '200 OK',
+        304 => '304 Not Modified',
+        400 => '400 Bad Request',
+        403 => '403 Forbidden',
+        404 => '404 Not Found',
+        405 => '405 Method Not Allowed',
+        413 => '413 Payload Too Large',
+        503 => '503 Service Unavailable',
+    );
+    my $cc = $hdr->{cache} // 'no-store';
+    my $extra = '';
+    $extra .= 'ETag: "' . $hdr->{etag} . '"' . "\r\n" if $hdr->{etag};
+    $extra .= 'Expires: ' . $hdr->{expires} . "\r\n" if $hdr->{expires};
+    if ($code == 304) {
+        cgi_out("Status: 304 Not Modified\r\nCache-Control: $cc\r\n${extra}\r\n");
+        return;
+    }
+    my $body = encode_json($obj);
+    cgi_out(
+        "Status: " . ($st{$code} // "$code")
+        . "\r\nCache-Control: $cc\r\n${extra}"
+        . "Content-Type: application/json; charset=utf-8\r\n\r\n",
+        $body
+    );
+}
+
+sub normalize_to {
+    my ($to) = @_;
+    $to = '' unless defined $to;
+    $to =~ s/^\s+|\s+$//g;
+    my $lc = lc $to;
+    return 'all' if $to eq '' || $lc eq 'all' || $lc eq 'broadcast'
+        || $lc eq '#broadcast' || $lc eq 'everyone';
+    $to =~ s/^@//;
+    return $to;
+}
+
+sub inject_human_message {
+    my ($to, $content, $files) = @_;
+    $content = '' unless defined $content;
+    $content =~ s/^\s+|\s+$//g;
+    $files = [] unless $files && ref $files eq 'ARRAY';
+    return 0 unless length $content || @$files;
+    my $obj = {
+        type    => 'message',
+        from    => 'human',
+        to      => normalize_to($to),
+        content => $content,
+        id      => 'h-' . time() . int(rand(1000)),
+    };
+    $obj->{files} = $files if @$files;
+    route_message($obj);
+    return 1;
+}
+
+sub hub_state_message {
+    my ($m) = @_;
+    my $out = {
+        ts      => $m->{ts}      // '',
+        type    => $m->{type}    // '',
+        from    => $m->{from}    // '',
+        to      => $m->{to}      // '',
+        content => $m->{content} // $m->{msg} // '',
+        id      => $m->{id}      // '',
+    };
+    if ($m->{files} && ref $m->{files} eq 'ARRAY' && @{$m->{files}}) {
+        $out->{files} = $m->{files};
+    }
+    return $out;
+}
+
+sub is_broadcast_to {
+    my ($to) = @_;
+    $to = '' unless defined $to;
+    $to =~ s/^@//;
+    my $lc = lc $to;
+    return 1 if $to eq '' || $lc eq 'all' || $lc eq 'broadcast'
+        || $lc eq '#broadcast' || $lc eq 'everyone';
+    return 0;
+}
+
+sub in_channel {
+    my ($m, $chan) = @_;
+    $chan ||= 'all';
+    my $t   = $m->{type} // '';
+    my $who = $m->{from} // '';
+    my $to  = $m->{to}   // '';
+    $to =~ s/^@//;
+    my $rid = $m->{id}   // '';
+    if ($chan eq 'all') {
+        return 1 if $t eq 'register' || $t eq 'disconnect' || $t eq 'error' || $t eq 'ack';
+        return is_broadcast_to($to);
+    }
+    if (($channels{$chan}{kind} // '') eq 'group') {
+        return 1 if $to eq $chan;
+        return 0;
+    }
+    # DM / agent channel
+    return 1 if ($t eq 'register' || $t eq 'disconnect') && ($rid eq $chan || $who eq $chan);
+    return 0 if ($channels{$to}{kind} // '') eq 'group';
+    return 1 if $to eq $chan;
+    return 1 if $who eq $chan && !is_broadcast_to($to);
+    return 0;
+}
+
+# A file chip is always one line. Text wraps as newline count + 1, plus a meta line.
+sub msg_lines {
+    my ($m) = @_;
+    my $n = 1;
+    if ($m->{files} && ref $m->{files} eq 'ARRAY') {
+        $n += scalar @{ $m->{files} };
+    }
+    my $c = $m->{content} // $m->{msg} // '';
+    if (length $c) {
+        $n += ($c =~ tr/\n//) + 1;
+    }
+    return $n < 1 ? 1 : $n;
+}
+
+sub history_page {
+    my ($chan, $page, $lines_per) = @_;
+    $chan ||= 'all';
+    $lines_per = 32 if !$lines_per || $lines_per < 8;
+    $lines_per = 80 if $lines_per > 80;
+    my @ch = grep { in_channel($_, $chan) } @log;
+    my @lens = map { msg_lines($_) } @ch;
+    my $total_lines = 0;
+    $total_lines += $_ for @lens;
+    my $pages = 1;
+    if ($total_lines > $lines_per) {
+        $pages = int(($total_lines + $lines_per - 1) / $lines_per);
+    }
+    $page = $pages if !defined $page || $page < 1 || $page > $pages;
+
+    # Pack messages onto pages by line budget (oldest = page 1).
+    my @page_idx;
+    my ($pno, $used) = (1, 0);
+    for my $i (0 .. $#ch) {
+        my $need = $lens[$i];
+        if ($used && $used + $need > $lines_per) {
+            $pno++;
+            $used = 0;
+        }
+        push @{ $page_idx[$pno] }, $i;
+        $used += $need;
+    }
+    $pages = $pno if $pno > $pages;
+    $page = $pages if $page > $pages;
+    my @slice = map { $ch[$_] } @{ $page_idx[$page] || [] };
+    return {
+        channel => $chan,
+        page    => $page + 0,
+        pages   => $pages + 0,
+        lines   => $lines_per + 0,
+        total   => scalar(@ch),
+        seq     => scalar(@log),
+        messages => [ map { hub_state_message($_) } @slice ],
+    };
+}
+
+sub file_meta_path { "$FILE_DIR/$_[0].json" }
+sub file_blob_path { "$FILE_DIR/$_[0].bin" }
+
+sub new_file_id {
+    my $id = sprintf('%08x%08x', time(), int(rand(2**32)));
+    $id .= sprintf('%04x', int(rand(0x10000)));
+    return $id;
+}
+
+sub save_upload {
+    my ($name, $mime, $bytes) = @_;
+    return unless defined $bytes && length $bytes;
+    return if length($bytes) > $MAX_UPLOAD;
+    $name = 'file' unless defined $name && $name =~ /\S/;
+    $name =~ s{.*/}{};
+    $name =~ s{[^\w.\- +()\[\]]+}{_}g;
+    $name = substr($name, 0, 180);
+    $mime ||= 'application/octet-stream';
+    my $id = new_file_id();
+    mkdir $FILE_DIR, 0755 unless -d $FILE_DIR;
+    open my $bf, '>', file_blob_path($id) or return;
+    binmode $bf;
+    print $bf $bytes;
+    close $bf;
+    my $meta = {
+        id    => $id,
+        name  => $name,
+        bytes => length($bytes),
+        mime  => $mime,
+        url   => "/api/files/$id",
+    };
+    if (open my $mf, '>', file_meta_path($id)) {
+        print $mf encode_json($meta);
+        close $mf;
+    }
+    return $meta;
+}
+
+sub load_file_meta {
+    my ($id) = @_;
+    return unless $id && $id =~ /^[0-9a-fA-F]{8,}$/;
+    open my $mf, '<', file_meta_path($id) or return;
+    local $/;
+    my $j = eval { decode_json(<$mf>) };
+    close $mf;
+    return $j;
+}
+
+sub agent_record {
+    my ($id, $live) = @_;
+    return {
+        id        => $id,
+        name      => $id,
+        connected => $live ? \1 : \0,
+    };
+}
+
+sub hub_state {
+    my @agents;
+    for my $id (sort keys %agents) {
+        next if $id =~ /^anon-/ || $id eq 'human' || $id eq '';
+        push @agents, agent_record($id, 1);
+    }
+    my @chlist;
+    for my $cid (sort keys %channels) {
+        my $c = $channels{$cid};
+        push @chlist, {
+            id      => $c->{id},
+            kind    => $c->{kind},
+            name    => $c->{name},
+            members => [ @{ $c->{members} || [] } ],
+        };
+    }
+    return {
+        agents   => \@agents,
+        seq      => scalar(@log),
+        channels => \@chlist,
+    };
+}
+
+sub handle_fcgi {
+    my ($req) = @_;
+    my $method = uc($ENV{REQUEST_METHOD} // 'GET');
+    my $path   = fcgi_path();
+    my $ctype  = $ENV{CONTENT_TYPE} // '';
+    my $clen   = $ENV{CONTENT_LENGTH} // 0;
+    my $is_upload = ($path =~ m{/api/files/?$}i && $method eq 'POST');
+    my $max_body  = $is_upload ? $MAX_UPLOAD : 65536;
+    if ($method eq 'POST' && $clen =~ /^\d+$/ && $clen > $max_body) {
+        json_out(413, { ok => \0, error => 'payload too large' });
+        return;
+    }
+    my $body = ($method eq 'POST' || $method eq 'PUT') ? fcgi_read_body($max_body) : '';
+    my $q = parse_urlencoded($ENV{QUERY_STRING} // '');
+    if ($method eq 'POST' && $ctype !~ m{json}i) {
+        my $pq = parse_urlencoded($body);
+        $q->{$_} = $pq->{$_} for keys %$pq;
+    }
+
+    # Static chrome for the ZHC-like signup (also served from httpd /htdocs/shared).
+    if ($path =~ m{^/shared/([A-Za-z0-9._-]+)$}) {
+        my $file = share_file($1);
+        if ($file && open my $fh, '<', $file) {
+            local $/;
+            my $s = <$fh>;
+            close $fh;
+            my $ct = 'application/octet-stream';
+            $ct = 'text/css; charset=utf-8' if $file =~ /\.css$/i;
+            $ct = 'text/javascript; charset=utf-8' if $file =~ /\.js$/i;
+            $ct = 'text/plain; charset=utf-8' if $file =~ /\.txt$/i;
+            cgi_out(
+                "Status: 200 OK\r\nCache-Control: public, max-age=86400\r\nContent-Type: $ct\r\n\r\n",
+                $s
+            );
+            return;
+        }
+        json_out(404, { ok => \0, error => 'missing shared file' }) if $path =~ m{\.json$}i;
+        fcgi_print('text/plain; charset=utf-8', "not found\n", '404 Not Found');
+        return;
+    }
+
+    if ($path =~ m{^/api/setup/challenge/?$}i
+        || ($q->{setup} // '') eq 'challenge'
+        || (($q->{action} // '') eq 'altcha_challenge' && $path =~ m{/api/}i)) {
+        json_out(200, pow_challenge(), { expires => http_date(time + 600) });
+        return;
+    }
+    if ($path =~ m{^/api/setup/status/?$}i) {
+        json_out(200, {
+            ok        => \1,
+            complete  => setup_complete() ? \1 : \0,
+            llm       => llm_configured() ? \1 : \0,
+            need_setup => (setup_complete() && llm_configured()) ? \0 : \1,
+        });
+        return;
+    }
+    if ($path =~ m{^/api/setup/?$}i && $method eq 'POST'
+        || (($q->{setup} // '') eq 'save' && $method eq 'POST')) {
+        my $obj = {};
+        if (($ctype || '') =~ /json/i) {
+            $obj = eval { decode_json($body) } || {};
+        } else {
+            $obj = { %$q };
+        }
+        if (!pow_ok(parse_altcha($obj))) {
+            json_out(400, { ok => \0, error => 'ALTCHA failed' });
+            return;
+        }
+        my $user = $obj->{user} // '';
+        my $pass = $obj->{password} // '';
+        $user =~ s/^\s+|\s+$//g;
+        if ($user !~ /^[a-zA-Z][a-zA-Z0-9._-]{1,31}$/) {
+            json_out(400, { ok => \0, error => 'username: letters, 2–32 chars' });
+            return;
+        }
+        if (length($pass) < 8) {
+            json_out(400, { ok => \0, error => 'password at least 8 characters' });
+            return;
+        }
+        my $base = $obj->{llm_base} || 'https://openrouter.ai/api/v1';
+        my $key  = $obj->{llm_key} // '';
+        $key =~ s/\s+//g;
+        if ($key eq '') {
+            json_out(400, { ok => \0, error => 'LLM API key required (or leave maintenance mode)' });
+            return;
+        }
+        my $mgmt = $obj->{mgmt_key} // '';
+        $mgmt =~ s/\s+//g;
+        write_llm_secrets($base, $key, $mgmt);
+        my $saved = save_setup({
+            complete   => JSON::PP::true,
+            user       => $user,
+            pass_hash  => bcrypt_hash($pass),
+            created    => strftime('%Y-%m-%dT%H:%M:%SZ', gmtime),
+            llm_base   => $base,
+            llm_key    => \1,
+            mgmt_key   => $mgmt ? JSON::PP::true : JSON::PP::false,
+            shared_key => $mgmt ? JSON::PP::false : JSON::PP::true,
+        });
+        if (!$saved) {
+            json_out(500, { ok => \0, error => 'could not write setup.json' });
+            return;
+        }
+        json_out(200, { ok => \1, shared_key => $mgmt ? \0 : \1 });
+        return;
+    }
+
+    if ($method eq 'POST' && !setup_complete()
+        && $path =~ m{/api/(send|channels|files)}i) {
+        json_out(503, { ok => \0, error => 'setup required' });
+        return;
+    }
+
+    if ($path =~ m{^/api/files/([0-9a-fA-F]+)(?:/.*)?$}i) {
+        my $id = $1;
+        if ($method ne 'GET' && $method ne 'HEAD') {
+            json_out(405, { ok => \0, error => 'GET required' });
+            return;
+        }
+        my $meta = load_file_meta($id);
+        if (!$meta) {
+            json_out(404, { ok => \0, error => 'no such file' });
+            return;
+        }
+        my $blob = file_blob_path($id);
+        if (!-f $blob) {
+            json_out(404, { ok => \0, error => 'missing blob' });
+            return;
+        }
+        open my $bf, '<', $blob or do {
+            json_out(404, { ok => \0, error => 'missing blob' });
+            return;
+        };
+        binmode $bf;
+        local $/;
+        my $data = <$bf> // '';
+        close $bf;
+        my $name = $meta->{name} || 'file';
+        $name =~ s/"//g;
+        my $mime = $meta->{mime} || 'application/octet-stream';
+        my $disp = ($q->{dl} || $q->{download}) ? 'attachment' : 'inline';
+        cgi_out(
+            "Status: 200 OK\r\nCache-Control: private, max-age=3600\r\n"
+            . "Content-Type: $mime\r\n"
+            . "Content-Length: " . length($data) . "\r\n"
+            . "Content-Disposition: $disp; filename=\"$name\"\r\n\r\n",
+            $data
+        );
+        return;
+    }
+
+    if ($path =~ m{^/api/files/?$}i && $method eq 'POST') {
+        my $name = $q->{name} // '';
+        if ($ctype =~ m{json}i) {
+            json_out(400, { ok => \0, error => 'send raw file body, not json' });
+            return;
+        }
+        my $meta = save_upload($name, $q->{mime} || $ctype, $body);
+        if (!$meta) {
+            json_out(400, { ok => \0, error => 'upload failed' });
+            return;
+        }
+        json_out(200, { ok => \1, %$meta });
+        return;
+    }
+
+    if ($path =~ m{^/api/channels/?$}i) {
+        if ($method eq 'GET') {
+            json_out(200, {
+                ok       => \1,
+                channels => [
+                    map {
+                        my $c = $channels{$_};
+                        {
+                            id      => $c->{id},
+                            kind    => $c->{kind},
+                            name    => $c->{name},
+                            members => [ @{ $c->{members} || [] } ],
+                        }
+                    } sort keys %channels
+                ],
+            });
+            return;
+        }
+        if ($method ne 'POST') {
+            json_out(405, { ok => \0, error => 'GET or POST' });
+            return;
+        }
+        my $obj = eval { decode_json($body) };
+        if (!$obj || ref $obj ne 'HASH') {
+            json_out(400, { ok => \0, error => 'invalid json' });
+            return;
+        }
+        my $ch = ensure_group_channel($obj->{id}, $obj->{name}, $obj->{members});
+        json_out(200, { ok => \1, channel => $ch });
+        return;
+    }
+
+    if ($path =~ m{/api/history/?$}i) {
+        my $chan  = normalize_to($q->{channel} // $q->{chan} // 'all');
+        my $page  = $q->{page};
+        $page = -1 if !defined $page || $page eq '' || $page eq 'last';
+        $page = 0 + $page if $page =~ /^-?\d+$/;
+        my $lines = 0 + ($q->{lines} || $q->{per} || 32);
+        my $hist = history_page($chan, $page, $lines);
+        my $etag = join('-', $hist->{seq}, $hist->{channel}, $hist->{page}, $hist->{pages}, $hist->{lines});
+        my $inm  = $ENV{HTTP_IF_NONE_MATCH} // '';
+        $inm =~ s/"//g;
+        if ($inm && $inm eq $etag) {
+            json_out(304, {}, {
+                etag  => $etag,
+                cache => ($hist->{page} < $hist->{pages}
+                    ? 'private, max-age=86400'
+                    : 'no-store'),
+            });
+            return;
+        }
+        json_out(200, $hist, {
+            etag  => $etag,
+            cache => ($hist->{page} < $hist->{pages}
+                ? 'private, max-age=86400'
+                : 'no-store'),
+        });
+        return;
+    }
+
+    my $want_json = ($path =~ m{/api/state/?$}i)
+        || (($q->{format} // '') eq 'json');
+
+    if ($path =~ m{/api/send/?$}i
+        && $method eq 'POST' && !setup_complete()) {
+        json_out(503, { ok => \0, error => 'setup required' });
+        return;
+    }
+
+    if ($path =~ m{/api/send/?$}i) {
+        if ($method ne 'POST') {
+            json_out(405, { ok => \0, error => 'POST required' });
+            return;
+        }
+        my ($to, $content);
+        if ($ctype =~ m{json}i) {
+            my $obj = eval { decode_json($body) };
+            if (!$obj || ref $obj ne 'HASH') {
+                json_out(400, { ok => \0, error => 'invalid json' });
+                return;
+            }
+            $to      = $obj->{to};
+            $content = $obj->{content};
+            my @files;
+            if ($obj->{files} && ref $obj->{files} eq 'ARRAY') {
+                for my $f (@{ $obj->{files} }) {
+                    next unless $f && ref $f eq 'HASH' && $f->{id};
+                    my $meta = load_file_meta($f->{id}) or next;
+                    push @files, $meta;
+                }
+            }
+            if (!inject_human_message($to, $content, \@files)) {
+                json_out(400, { ok => \0, error => 'content required' });
+                return;
+            }
+            json_out(200, { ok => \1, to => normalize_to($to) });
+            return;
+        } else {
+            $to      = $q->{to};
+            $content = $q->{content};
+        }
+        if (!inject_human_message($to, $content)) {
+            json_out(400, { ok => \0, error => 'content required' });
+            return;
+        }
+        json_out(200, { ok => \1, to => normalize_to($to) });
+        return;
+    }
+
+    if ($q->{send} && defined $q->{content} && length $q->{content}) {
+        inject_human_message($q->{to}, $q->{content});
+        if (!$want_json && $method eq 'POST') {
+            cgi_out("Status: 303 See Other\r\nLocation: /\r\nCache-Control: no-store\r\n\r\n");
+            return;
+        }
+    }
+
+    if ($want_json) {
+        json_out(200, hub_state());
+        return;
+    }
+
+    # /api/* is JSON only — never HTML (that was the "<!DOCTYPE" SyntaxError).
+    if ($path =~ m{^/api/}i) {
+        json_out(404, { ok => \0, error => 'not found' });
+        return;
+    }
+
+    if ($path =~ m{^/account/?$}i) {
+        if (!setup_complete() || !llm_configured()) {
+            fcgi_print('text/html; charset=utf-8', setup_html());
+            return;
+        }
+        cgi_out("Status: 303 See Other\r\nLocation: /\r\nCache-Control: no-store\r\n\r\n");
+        return;
+    }
+
+    if (!setup_complete() || !llm_configured()) {
+        fcgi_print('text/html; charset=utf-8', setup_html());
+        return;
+    }
+    fcgi_print('text/html; charset=utf-8', app_html());
+}
+
+sub apply_brand {
+    my ($html) = @_;
+    return '' unless defined $html;
+    my $name = $PRODUCT;
+    $name =~ s/&/&amp;/g;
+    $name =~ s/</&lt;/g;
+    $name =~ s/>/&gt;/g;
+    my $cookie = $COOKIE_PREFIX;
+    $cookie =~ s/[^A-Za-z0-9_]//g;
+    $cookie = 'PICOBUS' unless length $cookie;
+    $html =~ s/__PRODUCT__/$name/g;
+    $html =~ s/__COOKIE__/$cookie/g;
+    return $html;
+}
+
+sub setup_html {
+    for my $p (
+        ($SHARE_DIR ? "$SHARE_DIR/setup.html" : ()),
+        "$FindBin::Bin/../share/setup.html",
+        "/usr/local/share/picobus/setup.html",
+        "$FindBin::Bin/setup.html",
+    ) {
+        next unless $p && -f $p;
+        open my $fh, '<', $p or next;
+        local $/;
+        my $s = <$fh>;
+        close $fh;
+        return apply_brand($s) if defined $s && length $s;
+    }
+    return apply_brand(<<'SETUP_HTML');
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="picobus-cookie" content="__COOKIE__">
+<title>Create account — __PRODUCT__</title>
+<link rel="stylesheet" href="/shared/zhc-prefs.css">
+</head>
+<body>
+<header class="zhc-app-chrome"><nav class="zhc-product-nav" aria-label="Main"><a href="/">Home</a></nav><div id="zhc-theme-slot"></div></header>
+<main>
+<h1>Create account</h1>
+<p class="note">Complete ALTCHA under the password, then Continue.</p>
+<form class="auth" id="f" onsubmit="return false">
+<label for="user">Username</label>
+<input id="user" name="user" autocomplete="username" required>
+<label for="password">Password</label>
+<input id="password" name="password" type="password" autocomplete="new-password" required minlength="8">
+<div id="altcha-wrap">
+<altcha-widget id="altcha-widget" name="altcha" challengeurl="/api/setup/challenge" auto="off" hidefooter></altcha-widget>
+</div>
+<label for="llm_base">LLM HTTP URL</label>
+<input id="llm_base" name="llm_base" type="url" value="https://openrouter.ai/api/v1">
+<label for="llm_key">CEO API key</label>
+<input id="llm_key" name="llm_key" type="password" autocomplete="off" required>
+<label for="mgmt_key">OpenRouter management key (optional)</label>
+<input id="mgmt_key" name="mgmt_key" type="password" autocomplete="off">
+<p id="err" class="err"></p>
+<button type="button" class="btn" id="go">Continue</button>
+</form>
+</main>
+<script src="/shared/altcha-http-shim.js"></script>
+<script src="/shared/altcha-widget-v1.min.js" defer></script>
+<script src="/shared/crew-prefs.js" defer></script>
+<script>
+(function(){
+  var p='';
+  function w(){ return document.getElementById('altcha-widget'); }
+  function payload(){ var el=w(); return p || (el && el.value) || ''; }
+  customElements.whenDefined('altcha-widget').then(function(){
+    var el=w(); if(!el) return;
+    el.addEventListener('verified', function(ev){ p=(ev.detail&&ev.detail.payload)||''; });
+    el.addEventListener('statechange', function(ev){ if(ev.detail&&ev.detail.state==='verified'&&ev.detail.payload) p=ev.detail.payload; });
+  });
+  document.getElementById('go').onclick=function(){
+    var err=document.getElementById('err'); err.textContent='';
+    if(!payload()){ err.textContent='Complete the human check under your password first.'; return; }
+    var f=document.getElementById('f');
+    fetch('/api/setup',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({
+      user:f.user.value,password:f.password.value,llm_base:f.llm_base.value,llm_key:f.llm_key.value,mgmt_key:f.mgmt_key.value,altcha:payload()
+    })}).then(function(r){
+      var ct=r.headers.get('content-type')||'';
+      if(ct.indexOf('json')===-1) throw new Error('setup API returned HTML');
+      return r.json();
+    }).then(function(j){ if(!j.ok) throw new Error(j.error||'setup failed'); location.href='/'; })
+      .catch(function(e){ err.textContent=String(e); });
+  };
+})();
+</script>
+</body>
+</html>
+SETUP_HTML
+}
+
+sub app_html {
+    return apply_brand(<<'CHAT_HTML');
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="dark">
+<meta name="picobus-cookie" content="__COOKIE__">
+<title>__PRODUCT__</title>
+<style>
+:root {
+  --bg:#313338; --side:#2b2d31; --compose:#383a40; --hover:#35373c;
+  --sel:#404249; --text:#dbdee1; --head:#f2f3f5; --muted:#949ba4;
+  --sys:#6d6f78; --line:#3f4147; --blurple:#5865f2; --green:#23a559;
+  --yellow:#f0b232; --red:#f23f43; --off:#80848e; --me:#00a8fc;
+}
+* { box-sizing:border-box; }
+html,body { height:100%; margin:0; }
+body {
+  background:var(--bg); color:var(--text);
+  font:15px/1.375 system-ui,"Segoe UI",sans-serif;
+}
+.app { display:flex; height:100%; }
+.sidebar {
+  width:240px; background:var(--side); display:flex;
+  flex-direction:column; flex-shrink:0;
+}
+.brand {
+  padding:14px 16px; font-weight:700; color:var(--head);
+  border-bottom:1px solid #1f2023; letter-spacing:.02em;
+}
+.chan-label {
+  padding:16px 16px 6px; font-size:11px; font-weight:700;
+  letter-spacing:.06em; text-transform:uppercase; color:var(--muted);
+}
+#channels { flex:1; overflow-y:auto; padding:4px 8px 8px; }
+.chan {
+  display:flex; align-items:center; gap:8px; width:100%;
+  border:0; background:transparent; color:var(--muted); text-align:left;
+  padding:7px 8px; border-radius:4px; cursor:pointer; font:inherit;
+}
+.chan:hover { background:var(--hover); color:var(--text); }
+.chan.sel { background:var(--sel); color:var(--head); }
+.chan.offline { opacity:.55; }
+.chan .name { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; flex:1; }
+.chan .tag { margin-left:auto; font-size:10px; color:var(--off); }
+.chan .colon {
+  margin-left:4px; width:22px; flex-shrink:0; border:0; background:transparent;
+  color:var(--muted); cursor:pointer; font:700 16px/1 system-ui,sans-serif;
+}
+.chan .colon:hover { color:var(--head); }
+.add-chan { color:var(--muted); justify-content:center; font-weight:700; }
+.menu {
+  position:absolute; z-index:40; min-width:150px;
+  background:#1e1f22; border:1px solid #111; border-radius:6px;
+  padding:4px; box-shadow:0 8px 24px rgba(0,0,0,.45);
+}
+.menu button {
+  display:block; width:100%; text-align:left; border:0; background:transparent;
+  color:var(--text); padding:8px 10px; border-radius:4px; cursor:pointer; font:inherit;
+}
+.menu button:hover { background:var(--sel); }
+.menu button.danger { color:#f23f43; }
+.props {
+  position:fixed; z-index:50; left:50%; top:30%; transform:translate(-50%,0);
+  background:#1e1f22; border:1px solid var(--line); border-radius:8px;
+  padding:16px 18px; min-width:260px; color:var(--text);
+}
+.props h3 { margin:0 0 10px; color:var(--head); font-size:15px; }
+.props dl { margin:0; }
+.props dt { color:var(--muted); font-size:11px; text-transform:uppercase; margin-top:8px; }
+.props dd { margin:2px 0 0; }
+.props .close { margin-top:12px; }
+.hash { font-weight:700; color:var(--muted); }
+.dot {
+  width:10px; height:10px; border-radius:50%; flex-shrink:0;
+  background:var(--off);
+}
+.dot.on,.dot.green { background:var(--green); }
+.dot.yellow { background:var(--yellow); }
+.dot.red { background:var(--red); }
+.side-foot {
+  padding:10px 16px; font-size:12px; color:var(--muted);
+  border-top:1px solid #1f2023;
+}
+.main { flex:1; display:flex; flex-direction:column; min-width:0; }
+.head {
+  padding:12px 16px; border-bottom:1px solid var(--line);
+  font-weight:600; color:var(--head);
+  box-shadow:0 1px 0 rgba(0,0,0,.2);
+}
+.stage { flex:1; min-height:0; display:flex; }
+#panes { flex:1; min-width:0; min-height:0; position:relative; display:flex; flex-direction:column; }
+.transcript { flex:1; overflow-y:auto; padding:16px 16px 8px; min-height:0; }
+.transcript[hidden] { display:none !important; }
+.pager {
+  width:48px; flex-shrink:0; display:flex; flex-direction:column;
+  align-items:center; gap:1px; padding:6px 2px;
+  border-left:1px solid var(--line); overflow:hidden; color:var(--muted);
+  font:12px/1.1 ui-monospace,Menlo,monospace;
+}
+.pager button {
+  background:transparent; border:0; color:var(--muted); cursor:pointer;
+  width:42px; padding:5px 0; font:inherit;
+}
+.pager button:hover { color:var(--head); background:var(--hover); }
+.pager button.cur { color:var(--head); font-weight:700; background:var(--sel); border-radius:4px; }
+.pager button:disabled { opacity:.3; cursor:default; }
+/* |<-- is a left arrow; +90° points up. (was -90° = down) */
+.rot-up { transform:rotate(90deg); display:inline-block; }
+.rot-dn { transform:rotate(90deg); display:inline-block; }
+.msg { margin:0 0 14px; }
+.msg .who { font-weight:600; color:var(--head); margin-right:8px; }
+.msg.me .who { color:var(--me); }
+.msg .to { color:var(--muted); font-size:12px; margin-right:8px; }
+.msg .ts { color:var(--sys); font-size:12px; }
+.msg .body { white-space:pre-wrap; word-wrap:break-word; }
+.msg.sys { color:var(--sys); font-size:13px; }
+.msg.sys .ts { margin-left:8px; }
+.filechip {
+  display:flex; align-items:center; gap:8px; flex-wrap:wrap;
+  margin-top:6px; padding:6px 8px; background:#2b2d31; border-radius:6px;
+  max-width:100%;
+}
+.filechip a.name { color:#8ab4f8; text-decoration:none; font-weight:600; }
+.filechip a.name:hover { text-decoration:underline; }
+.filechip .ico {
+  width:26px; height:26px; border:0; border-radius:4px; cursor:pointer;
+  background:var(--compose); color:var(--head); font-size:14px; line-height:26px;
+}
+.filechip .sz { color:var(--muted); font-size:12px; }
+.compose { padding:0 16px 20px; }
+.compose-box {
+  background:var(--compose); border-radius:8px;
+  display:flex; align-items:flex-end; gap:8px; padding:8px 10px;
+}
+textarea {
+  flex:1; background:transparent; border:0; color:var(--text);
+  font:inherit; resize:none; min-height:40px; max-height:160px; outline:none;
+}
+textarea::placeholder { color:var(--sys); }
+.compose-box > button, .compose-box > label.ico {
+  background:var(--blurple); color:#fff; border:0; border-radius:4px;
+  padding:8px 14px; cursor:pointer; font:600 14px system-ui,sans-serif;
+}
+.compose-box > label.ico { padding:8px 10px; background:var(--sel); }
+.compose-box > button:hover { filter:brightness(1.08); }
+.pending { font-size:12px; color:var(--muted); padding:4px 16px 0; }
+.transcript::-webkit-scrollbar,#channels::-webkit-scrollbar { width:8px; }
+.transcript::-webkit-scrollbar-thumb,#channels::-webkit-scrollbar-thumb {
+  background:#1a1b1e; border-radius:4px;
+}
+</style>
+</head>
+<body>
+<div class="app">
+  <aside class="sidebar">
+    <div class="brand">__PRODUCT__</div>
+    <div class="chan-label">Channels</div>
+    <div id="channels">
+      <button type="button" class="chan sel" data-id="all"><span class="hash">#</span>broadcast</button>
+    </div>
+    <div class="side-foot" id="side-foot">0 online</div>
+  </aside>
+  <section class="main">
+    <header class="head" id="head">#broadcast</header>
+    <div class="stage">
+      <div id="panes">
+        <div class="transcript" data-chan="all"></div>
+      </div>
+      <nav class="pager" id="pager" aria-label="history pages"></nav>
+    </div>
+    <div class="pending" id="pending"></div>
+    <form class="compose" id="composer" method="POST" action="/">
+      <input type="hidden" name="to" id="to-field" value="all">
+      <input type="hidden" name="send" value="send">
+      <input type="file" id="file-input" hidden multiple>
+      <div class="compose-box">
+        <label class="ico" for="file-input" title="attach file">+</label>
+        <textarea name="content" id="content" rows="1" placeholder="Message #broadcast"></textarea>
+        <button type="submit">Send</button>
+      </div>
+    </form>
+  </section>
+</div>
+<script>
+(function () {
+  var selected = "all";
+  var lastAgentsRaw = "";
+  var lastData = { agents: [], scores: {}, seq: 0 };
+  var paneMap = {};
+  var pendingFiles = [];
+  var pane, panesRoot, channels, head, toField, content, composer, sideFoot, pager, pendingEl, fileInput;
+
+  function $(id) { return document.getElementById(id); }
+  function esc(s) {
+    return String(s == null ? "" : s).replace(/[&<>"']/g, function (c) {
+      return { "&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#39;" }[c];
+    });
+  }
+  function nearBottom(el) {
+    return el.scrollHeight - el.scrollTop - el.clientHeight <= 64;
+  }
+  function fmtTs(ts) {
+    var s = String(ts || "");
+    var m = s.match(/T(\d{2}:\d{2}(?::\d{2})?)/);
+    return m ? m[1] : s;
+  }
+  function dotClass(a) {
+    var b = a.band || "";
+    if (b === "Green") return "dot green";
+    if (b === "Yellow") return "dot yellow";
+    if (b === "Red") return "dot red";
+    return a.connected ? "dot on" : "dot off";
+  }
+  function scoreTitle(a) {
+    var bits = [a.connected ? "online" : "offline"];
+    if (a.band) bits.push(a.band);
+    if (a.E != null) bits.push("E " + Number(a.E).toFixed(2));
+    if (a.I != null) bits.push("I " + Number(a.I).toFixed(2));
+    return bits.join(" · ");
+  }
+  function isBroadcastTo(to) {
+    to = String(to || "").replace(/^@/, "");
+    var lc = to.toLowerCase();
+    return !to || lc === "all" || lc === "broadcast" || lc === "#broadcast" || lc === "everyone";
+  }
+  function inChannel(m, chan) {
+    var t = m.type || "";
+    var who = m.from || "";
+    var to = m.to || "";
+    var rid = m.id || "";
+    if (chan === "all") {
+      if (t === "register" || t === "disconnect" || t === "error" || t === "ack") return true;
+      return isBroadcastTo(to);
+    }
+    if (t === "register" || t === "disconnect") return rid === chan || who === chan;
+    if (who === chan && !isBroadcastTo(to)) return true;
+    if (to === chan || to === "@" + chan) return true;
+    return false;
+  }
+  function linesPer() {
+    var el = paneMap[selected] && paneMap[selected].el;
+    var h = (el && el.clientHeight) ? el.clientHeight : 420;
+    var n = Math.floor(h / 22);
+    if (n < 16) n = 16;
+    if (n > 80) n = 80;
+    return n;
+  }
+  function humSize(n) {
+    n = Number(n) || 0;
+    if (n < 1024) return n + " bytes";
+    if (n < 1024 * 1024) {
+      var k = n / 1024;
+      return (k < 10 ? k.toFixed(1) : String(Math.round(k))) + " k";
+    }
+    if (n < 1024 * 1024 * 1024) {
+      var m = n / (1024 * 1024);
+      return (m < 10 ? m.toFixed(1) : String(Math.round(m))) + " m";
+    }
+    var g = n / (1024 * 1024 * 1024);
+    return g.toFixed(1) + " g";
+  }
+  function ensurePane(id) {
+    id = id || "all";
+    if (paneMap[id]) return paneMap[id];
+    var el = document.createElement("div");
+    el.className = "transcript";
+    el.setAttribute("data-chan", id);
+    el.hidden = id !== selected;
+    if (panesRoot) panesRoot.appendChild(el);
+    paneMap[id] = { el: el, page: 0, pages: 1, follow: true, seq: -1 };
+    return paneMap[id];
+  }
+  function showPane(id) {
+    id = id || "all";
+    ensurePane(id);
+    Object.keys(paneMap).forEach(function (k) {
+      paneMap[k].el.hidden = k !== id;
+    });
+    pane = paneMap[id].el;
+  }
+  function selectTarget(id) {
+    selected = id || "all";
+    if (toField) toField.value = selected;
+    var label = channelLabel(selected);
+    if (head) head.textContent = label;
+    if (content) content.placeholder = "Message " + label;
+    showPane(selected);
+    renderChannels(lastData.agents || []);
+    loadHistory(selected);
+  }
+  function channelLabel(id) {
+    if (!id || id === "all") return "#system";
+    var chs = lastData.channels || [];
+    for (var i = 0; i < chs.length; i++) {
+      if (chs[i].id === id) {
+        if (chs[i].kind === "group") return "#" + (chs[i].name || id);
+        return "@" + (chs[i].name || id);
+      }
+    }
+    return id.indexOf("g:") === 0 ? "#" + id.slice(2) : "@" + id;
+  }
+  function renderChannels(agents) {
+    var html = '<button type="button" class="chan' + (selected === "all" ? " sel" : "")
+      + '" data-id="all"><span class="hash">#</span>system</button>';
+    var online = 0;
+    for (var i = 0; i < agents.length; i++) {
+      var a = agents[i];
+      if (a.connected) online++;
+      var label = a.name || a.id;
+      html += '<div class="chan'
+        + (a.connected ? "" : " offline")
+        + (selected === a.id ? " sel" : "")
+        + '" data-id="' + esc(a.id) + '" title="' + esc(scoreTitle(a)) + '">'
+        + '<span class="' + dotClass(a) + '"></span>'
+        + '<span class="name">' + esc(label) + "</span>"
+        + (a.connected ? "" : '<span class="tag">offline</span>')
+        + "</div>";
+    }
+    var chs = lastData.channels || [];
+    for (var j = 0; j < chs.length; j++) {
+      var c = chs[j];
+      if (c.kind !== "group") continue;
+      html += '<button type="button" class="chan' + (selected === c.id ? " sel" : "")
+        + '" data-id="' + esc(c.id) + '"><span class="hash">#</span>'
+        + esc(c.name || c.id) + "</button>";
+    }
+    if (channels) channels.innerHTML = html;
+    if (sideFoot) sideFoot.textContent = online + " online";
+  }
+  function messageHtml(m) {
+    var t = m.type || "";
+    if (t === "register") {
+      return '<div class="msg sys">' + esc(m.id || m.from) + " connected"
+        + '<span class="ts">' + esc(fmtTs(m.ts)) + "</span></div>";
+    }
+    if (t === "disconnect") {
+      return '<div class="msg sys">' + esc(m.id || m.from) + " disconnected"
+        + '<span class="ts">' + esc(fmtTs(m.ts)) + "</span></div>";
+    }
+    if (t === "error" || t === "ack") {
+      return '<div class="msg sys">' + esc(t) + ": " + esc(m.content)
+        + '<span class="ts">' + esc(fmtTs(m.ts)) + "</span></div>";
+    }
+    var who = m.from || "unknown";
+    var to = m.to || "all";
+    var dest = isBroadcastTo(to) ? "#broadcast" : "@" + to;
+    var files = m.files || [];
+    var chips = "";
+    for (var i = 0; i < files.length; i++) chips += fileChip(files[i]);
+    var body = m.content ? '<div class="body">' + esc(m.content) + "</div>" : "";
+    return '<div class="msg' + (who === "human" ? " me" : "") + '">'
+      + '<div class="meta"><span class="who">' + esc(who) + "</span>"
+      + '<span class="to">→ ' + esc(dest) + "</span>"
+      + '<span class="ts" title="' + esc(m.ts) + '">' + esc(fmtTs(m.ts)) + "</span></div>"
+      + body + chips + "</div>";
+  }
+  function fileChip(f) {
+    var id = f.id || "";
+    var name = f.name || "file";
+    var href = "/api/files/" + encodeURIComponent(id);
+    var dl = href + "?dl=1";
+    return '<div class="filechip" data-id="' + esc(id) + '" data-name="' + esc(name) + '" data-mime="' + esc(f.mime || "") + '" data-bytes="' + esc(f.bytes || 0) + '">'
+      + '<a class="name" href="' + href + '" target="_blank" rel="noopener">' + esc(name) + "</a>"
+      + '<button type="button" class="ico dl" title="download" data-act="dl">↓</button>'
+      + '<button type="button" class="ico clip" title="copy file to clipboard" data-act="clip">⧉</button>'
+      + '<span class="sz">' + esc(humSize(f.bytes)) + "</span></div>";
+  }
+  function emptyHtml(chan) {
+    var label = chan === "all" ? "#broadcast" : "@" + chan;
+    return '<div class="msg sys">No messages in ' + esc(label) + " yet.</div>";
+  }
+  function renderPager() {
+    if (!pager) return;
+    var st = paneMap[selected];
+    if (!st) { pager.innerHTML = ""; return; }
+    var pages = st.pages || 1;
+    var cur = st.page || 1;
+    var h = pager.clientHeight || 400;
+    var btnH = 26;
+    var slots = Math.floor((h - btnH * 7) / btnH);
+    if (slots < 3) slots = 3;
+    if (slots > 10) slots = 10;
+    if (slots % 2 === 0) slots--;
+    var half = Math.floor(slots / 2);
+    var start = cur - half;
+    var end = cur + half;
+    if (start < 1) { end += 1 - start; start = 1; }
+    if (end > pages) { start -= (end - pages); end = pages; }
+    if (start < 1) start = 1;
+    function b(cls, inner, title, go, dis) {
+      return '<button type="button" class="' + cls + '" data-go="' + go + '" title="' + title + '"'
+        + (dis ? " disabled" : "") + ">" + inner + "</button>";
+    }
+    var html = "";
+    html += b("", '<span class="rot-up">|&lt;--</span>', "first page", "first", cur <= 1);
+    html += b("", '<span class="rot-up">&lt;&lt;</span>', "back 10 pages", "-10", cur <= 1);
+    html += b("", '<span class="rot-up">&lt;</span>', "previous page", "-1", cur <= 1);
+    for (var n = start; n <= end; n++) {
+      html += b(n === cur ? "cur" : "", String(n), "page " + n, String(n), false);
+    }
+    html += b("", '<span class="rot-dn">&gt;</span>', "next page", "+1", cur >= pages);
+    html += b("", '<span class="rot-dn">&gt;&gt;</span>', "forward 10 pages", "+10", cur >= pages);
+    html += b("", '<span class="rot-dn">--&gt;|</span>', "last page", "last", cur >= pages);
+    pager.innerHTML = html;
+  }
+  function goPage(spec) {
+    var st = paneMap[selected];
+    if (!st) return;
+    var cur = st.page || 1, pages = st.pages || 1, next = cur;
+    if (spec === "first") next = 1;
+    else if (spec === "last") next = pages;
+    else if (spec === "-10") next = cur - 10;
+    else if (spec === "+10") next = cur + 10;
+    else if (spec === "-1") next = cur - 1;
+    else if (spec === "+1") next = cur + 1;
+    else next = parseInt(spec, 10) || cur;
+    if (next < 1) next = 1;
+    if (next > pages) next = pages;
+    st.follow = (next >= pages);
+    st.page = next;
+    loadHistory(selected);
+  }
+  function loadHistory(chan) {
+    chan = chan || selected;
+    var st = ensurePane(chan);
+    var page = st.follow ? "last" : String(st.page || "last");
+    var url = "/api/history?channel=" + encodeURIComponent(chan)
+      + "&page=" + encodeURIComponent(page) + "&lines=" + linesPer();
+    var isLast = st.follow || page === "last";
+    fetch(url, { cache: isLast ? "no-store" : "default" }).then(function (r) {
+      if (r.status === 304) return null;
+      return r.json();
+    }).then(function (h) {
+      if (!h) return;
+      st.pages = h.pages || 1;
+      st.page = h.page || 1;
+      st.seq = h.seq || 0;
+      var msgs = h.messages || [];
+      var html = "";
+      for (var i = 0; i < msgs.length; i++) html += messageHtml(msgs[i]);
+      if (!html) html = emptyHtml(chan);
+      st.el.innerHTML = html;
+      if (st.follow) st.el.scrollTop = st.el.scrollHeight;
+      if (chan === selected) renderPager();
+    }).catch(function () {});
+  }
+  function applyAgents(data) {
+    var raw = JSON.stringify(data.agents || []);
+    var seq = data.seq || 0;
+    lastData = data;
+    if (raw !== lastAgentsRaw) {
+      lastAgentsRaw = raw;
+      var agents = data.agents || [];
+      for (var i = 0; i < agents.length; i++) ensurePane(agents[i].id);
+      renderChannels(agents);
+    }
+    var st = paneMap[selected] || ensurePane(selected);
+    if (st.seq !== seq) {
+      if (st.follow) loadHistory(selected);
+      else st.seq = seq;
+    }
+  }
+  function tick() {
+    fetch("/api/state", { cache: "no-store" }).then(function (r) { return r.json(); }).then(applyAgents).catch(function () {});
+  }
+  function refreshPending() {
+    if (!pendingEl) return;
+    if (!pendingFiles.length) { pendingEl.textContent = ""; return; }
+    pendingEl.textContent = pendingFiles.map(function (f) {
+      return f.name + " (" + humSize(f.bytes) + ")";
+    }).join(" · ");
+  }
+  function uploadFile(file) {
+    var q = "/api/files?name=" + encodeURIComponent(file.name)
+      + "&mime=" + encodeURIComponent(file.type || "application/octet-stream");
+    return fetch(q, { method: "POST", body: file }).then(function (r) { return r.json(); }).then(function (j) {
+      if (j && j.ok && j.id) pendingFiles.push(j);
+      refreshPending();
+    });
+  }
+  function send(ev) {
+    if (ev) ev.preventDefault();
+    var text = (content.value || "").replace(/^\s+|\s+$/g, "");
+    if (!text && !pendingFiles.length) return;
+    var to = selected || "all";
+    var files = pendingFiles.map(function (f) {
+      return { id: f.id, name: f.name, bytes: f.bytes, mime: f.mime };
+    });
+    fetch("/api/send", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ to: to, content: text, files: files })
+    }).then(function (r) {
+      if (!r.ok) return;
+      content.value = "";
+      pendingFiles = [];
+      refreshPending();
+      var st = paneMap[selected];
+      if (st) { st.follow = true; }
+      tick();
+    }).catch(function () {});
+    content.focus();
+  }
+  function onChipClick(ev) {
+    var btn = ev.target;
+    if (!btn || !btn.getAttribute) return;
+    var act = btn.getAttribute("data-act");
+    if (!act) return;
+    var chip = btn;
+    while (chip && chip !== panesRoot && !(chip.className && chip.className.indexOf("filechip") >= 0)) {
+      chip = chip.parentNode;
+    }
+    if (!chip || !chip.getAttribute) return;
+    ev.preventDefault();
+    var id = chip.getAttribute("data-id");
+    var name = chip.getAttribute("data-name") || "file";
+    var mime = chip.getAttribute("data-mime") || "application/octet-stream";
+    var href = "/api/files/" + encodeURIComponent(id);
+    if (act === "dl") {
+      var a = document.createElement("a");
+      a.href = href + "?dl=1";
+      a.download = name;
+      a.click();
+      return;
+    }
+    if (act === "clip") {
+      var bytes = Number(chip.getAttribute("data-bytes") || 0);
+      if (bytes >= 1024 * 1024 * 1024) {
+        btn.title = "too large for clipboard";
+        return;
+      }
+      fetch(href).then(function (r) { return r.blob(); }).then(function (blob) {
+        var type = mime.indexOf("/") > 0 ? mime : "application/octet-stream";
+        if (navigator.clipboard && window.ClipboardItem) {
+          var item = {};
+          item[type] = blob;
+          return navigator.clipboard.write([new ClipboardItem(item)]).catch(function () {
+            return navigator.clipboard.writeText(location.origin + href);
+          });
+        }
+        return navigator.clipboard.writeText(location.origin + href);
+      }).catch(function () {});
+    }
+  }
+  function init() {
+    panesRoot = $("panes");
+    pager = $("pager");
+    pendingEl = $("pending");
+    fileInput = $("file-input");
+    var existing = panesRoot ? panesRoot.querySelector('[data-chan="all"]') : null;
+    if (existing) {
+      paneMap.all = { el: existing, page: 0, pages: 1, follow: true, seq: -1 };
+      pane = existing;
+    } else {
+      ensurePane("all");
+    }
+    showPane("all");
+    channels = $("channels");
+    head = $("head");
+    toField = $("to-field");
+    content = $("content");
+    composer = $("composer");
+    sideFoot = $("side-foot");
+    channels.addEventListener("click", function (e) {
+      var el = e.target;
+      while (el && el !== channels && !(el.getAttribute && el.getAttribute("data-id"))) el = el.parentNode;
+      if (el && el.getAttribute && el.getAttribute("data-id")) selectTarget(el.getAttribute("data-id"));
+    });
+    if (pager) pager.addEventListener("click", function (e) {
+      var el = e.target;
+      while (el && el !== pager && !el.getAttribute("data-go")) el = el.parentNode;
+      if (el && el.getAttribute("data-go")) goPage(el.getAttribute("data-go"));
+    });
+    if (panesRoot) panesRoot.addEventListener("click", onChipClick);
+    composer.addEventListener("submit", send);
+    content.addEventListener("keydown", function (e) {
+      if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); }
+    });
+    if (fileInput) fileInput.addEventListener("change", function () {
+      var files = fileInput.files || [];
+      var chain = Promise.resolve();
+      for (var i = 0; i < files.length; i++) {
+        (function (f) { chain = chain.then(function () { return uploadFile(f); }); })(files[i]);
+      }
+      chain.then(function () { fileInput.value = ""; });
+    });
+    window.addEventListener("resize", function () { renderPager(); loadHistory(selected); });
+    tick();
+    setInterval(tick, 1500);
+  }
+  if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", init);
+  else init();
+})();
+</script>
+</body>
+</html>
+CHAT_HTML
+}
+
+# FastCGI records for the hub-owned listen socket. FCGI.pm Accept() plus
+# IO::Select on the same listen fd busy-loops (select says ready, Accept
+# never calls accept(2)), so we speak the protocol ourselves.
+sub fcgi_readn {
+    my ($fh, $n) = @_;
+    my $buf = '';
+    while (length($buf) < $n) {
+        my $r = read($fh, my $chunk, $n - length($buf));
+        return undef if !defined $r || $r == 0;
+        $buf .= $chunk;
+    }
+    return $buf;
+}
+
+sub fcgi_read_record {
+    my ($fh) = @_;
+    my $hdr = fcgi_readn($fh, 8);
+    return unless defined $hdr;
+    my ($ver, $type, $id, $clen, $pad) = unpack('CCnnC', $hdr);
+    my $content = $clen ? fcgi_readn($fh, $clen) : '';
+    return unless defined $content;
+    fcgi_readn($fh, $pad) if $pad;
+    return ($type, $id, $content);
+}
+
+sub fcgi_write_record {
+    my ($fh, $type, $id, $content) = @_;
+    $content //= '';
+    my $clen = length $content;
+    my $pad  = (8 - ($clen % 8)) % 8;
+    print $fh pack('CCnnCC', 1, $type, $id, $clen, $pad, 0),
+        $content, ("\0" x $pad);
+}
+
+sub fcgi_nv_decode {
+    my ($s) = @_;
+    my %h;
+    my $off = 0;
+    my $len = length($s);
+    while ($off < $len) {
+        last if $off + 1 > $len;
+        my $nlen = unpack('C', substr($s, $off, 1));
+        if ($nlen & 0x80) {
+            last if $off + 4 > $len;
+            $nlen = unpack('N', substr($s, $off, 4)) & 0x7fffffff;
+            $off += 4;
+        } else {
+            $off += 1;
+        }
+        last if $off + 1 > $len;
+        my $vlen = unpack('C', substr($s, $off, 1));
+        if ($vlen & 0x80) {
+            last if $off + 4 > $len;
+            $vlen = unpack('N', substr($s, $off, 4)) & 0x7fffffff;
+            $off += 4;
+        } else {
+            $off += 1;
+        }
+        last if $off + $nlen + $vlen > $len;
+        my $k = substr($s, $off, $nlen); $off += $nlen;
+        my $v = substr($s, $off, $vlen); $off += $vlen;
+        $h{$k} = $v;
+    }
+    return \%h;
+}
+
+sub fcgi_serve_conn {
+    my ($fh) = @_;
+    $fh->blocking(1);
+    $fh->autoflush(1);
+    my %env;
+    my $stdin = '';
+    my $reqid = 1;
+    my $got_begin = 0;
+    eval {
+        local $SIG{ALRM} = sub { die "fcgi timeout\n" };
+        alarm 15;
+        while (1) {
+            my ($type, $id, $content) = fcgi_read_record($fh);
+            last unless defined $type;
+            $reqid = $id if $id;
+            if ($type == 1) { $got_begin = 1; next }          # BEGIN_REQUEST
+            if ($type == 4) {                                 # PARAMS
+                %env = (%env, %{ fcgi_nv_decode($content) }) if length $content;
+                next;
+            }
+            if ($type == 5) {                                 # STDIN
+                $stdin .= $content if length $content;
+                my $need = $env{CONTENT_LENGTH} // '';
+                last if !length $content
+                    || ($need =~ /^\d+$/ && length($stdin) >= $need);
+                next;
+            }
+        }
+        alarm 0;
+    };
+    alarm 0;
+    return unless $got_begin;
+
+    local %ENV = (%ENV, %env);
+    $FCGI_STDIN_BUF = $stdin;
+    $FCGI_BUF = '';
+    eval { handle_fcgi(undef) };
+    if ($@) {
+        warn "fcgi handler: $@";
+        $FCGI_BUF = '';
+        json_out(500, { ok => \0, error => 'hub error' });
+    } elsif (!length($FCGI_BUF // '') && ($ENV{REQUEST_URI} // '') =~ m{/api/}) {
+        json_out(500, { ok => \0, error => 'empty api response' });
+    }
+    my $out = $FCGI_BUF // '';
+    $FCGI_BUF = undef;
+    $FCGI_STDIN_BUF = undef;
+
+    my $off = 0;
+    while ($off < length($out)) {
+        my $chunk = substr($out, $off, 65535);
+        $off += length $chunk;
+        fcgi_write_record($fh, 6, $reqid, $chunk);            # STDOUT
+    }
+    fcgi_write_record($fh, 6, $reqid, '');                    # end STDOUT
+    fcgi_write_record($fh, 3, $reqid, pack('NCCCC', 0, 0, 0, 0, 0));  # END_REQUEST
+    close $fh;
+}
+
+# ---------- main loop ----------
+# FCGI.pm's XS layer uses alarm() as an accept timeout when no web server
+# manages the listen socket; without a handler SIGALRM's default action
+# kills the process. Ignore it — Accept() then just returns -1 and the
+# select loop below services agents. The hub-owned FCGI socket is handled
+# with IO::Socket + fcgi_serve_conn instead.
+$SIG{ALRM} = 'IGNORE';
+$SIG{PIPE} = 'IGNORE';
+
+# FCGI stdin is a unix socket when httpd/slowcgi is in front. A tty or
+# /dev/null makes Accept() block and starves the agent socket — skip it.
+# Otherwise bind FCGI_SOCK ourselves so httpd can talk to this daemon.
+my $DO_FCGI = ($ENV{HUB_NOFCGI} // '') ne '1'
+    && defined fileno(STDIN) && stat(STDIN) && -S _;
+my $request;
+my $fcgi_listen_fh;
+if ($DO_FCGI) {
+    $request = FCGI::Request();
+    fcntl(STDIN, F_GETFL, my $flags = 0);
+    fcntl(STDIN, F_SETFL, $flags | O_NONBLOCK);
+} elsif (($ENV{HUB_NOFCGI} // '') ne '1' && $FCGI_SOCK) {
+    my $d = _parent_dir($FCGI_SOCK);
+    mkdir $d, 0755 unless -d $d;
+    unlink $FCGI_SOCK if -e $FCGI_SOCK;
+    $fcgi_listen_fh = IO::Socket::UNIX->new(
+        Local  => $FCGI_SOCK,
+        Type   => SOCK_STREAM,
+        Listen => 32,
+    ) or die "fcgi listen $FCGI_SOCK: $!\n";
+    $fcgi_listen_fh->blocking(0);
+    chmod 0666, $FCGI_SOCK;
+    $sel->add($fcgi_listen_fh);
+    $DO_FCGI = 1;
+}
+
+hub_sandbox();
+
+print STDERR "picobus listening agents=$HUB_SOCK fcgi=", ($DO_FCGI ? ($FCGI_SOCK // 'stdin') : 'off'), "\n";
+
+while (1) {
+    # STDIN-style FCGI (slowcgi): poll. Own listen socket: handled in select.
+    if ($DO_FCGI && $request && !$fcgi_listen_fh && $request->Accept() >= 0) {
+        handle_fcgi($request);
+        $request->Finish();
+    }
+
+    # 2. Unix side
+    my @ready = $sel->can_read($SELECT_TO);
+    for my $fh (@ready) {
+        if ($fcgi_listen_fh && defined(fileno($fh)) && defined(fileno($fcgi_listen_fh))
+            && fileno($fh) == fileno($fcgi_listen_fh)) {
+            my $c = $fcgi_listen_fh->accept;
+            fcgi_serve_conn($c) if $c;
+            next;
+        }
+        if (defined(fileno($fh)) && fileno($fh) == fileno($hub)) {
+            my $client = $hub->accept or next;
+            $client->blocking(0);
+            $sel->add($client);
+            # temporary id until register
+            my $tmp = "anon-" . fileno($client);
+            $agents{$tmp} = { sock => $client, buf => '' };
+            $fd2id{fileno($client)} = $tmp;
+            next;
+        }
+
+        # data from an agent
+        my $fn = fileno($fh);
+        my $id = $fd2id{$fn} or do { close_agent($fh); next };
+        my $bufref = \$agents{$id}{buf};
+
+        my $n = sysread($fh, my $chunk, 8192);
+        if (!defined $n) {
+            next if $!{EAGAIN} || $!{EWOULDBLOCK};
+            close_agent($fh);
+            next;
+        }
+        if ($n == 0) {
+            close_agent($fh);
+            next;
+        }
+        $$bufref .= $chunk;
+
+        while ($$bufref =~ s/^(.*?)\n//) {
+            my $line = $1;
+            next unless length $line;
+            # first line may be a register that changes the id
+            if ($line =~ /"type"\s*:\s*"register"/) {
+                my $obj = eval { decode_json($line) };
+                if ($obj && $obj->{id}) {
+                    my $new = $obj->{id};
+                    delete $agents{$id};
+                    $agents{$new} = { sock => $fh, buf => $$bufref };
+                    $fd2id{$fn} = $new;
+                    $id = $new;
+                    log_msg({ type => 'register', id => $new });
+                    ensure_dm_channel($new);
+                    refresh_team_group();
+                    next;
+                }
+            }
+            handle_agent_line($id, $line);
+        }
+    }
+}
+
+# cleanup on exit (rarely reached)
+END {
+    unlink $HUB_SOCK if $HUB_SOCK && -e $HUB_SOCK;
+}

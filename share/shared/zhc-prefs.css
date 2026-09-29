@@ -1,0 +1,1063 @@
+/* ZHC appearance + cookie disclosure + content-aligned theme control. */
+:root {
+  --zhc-tray-fg: #e8f4ff;
+  --zhc-tray-muted: rgba(180, 220, 255, 0.78);
+  --zhc-tray-bg: rgba(6, 14, 28, 0.96);
+  --zhc-tray-border: rgba(0, 229, 255, 0.45);
+  --zhc-tray-accent: #7ee8ff;
+  --zhc-tray-chip-bg: rgba(0, 229, 255, 0.12);
+  --zhc-panel-bg: #0a1524;
+  --zhc-panel-fg: #e8f4ff;
+  --zhc-danger: #f07178;
+  --zhc-ok: #7fd99a;
+  --zhc-content-max: 42rem; /* align tools with typical page content width */
+}
+
+html[data-zhc-theme="light"] {
+  --zhc-tray-fg: #1a2a3a;
+  --zhc-tray-muted: #4a5a6a;
+  --zhc-tray-bg: rgba(255, 255, 255, 0.97);
+  --zhc-tray-border: rgba(0, 80, 120, 0.28);
+  --zhc-tray-accent: #0070ba;
+  --zhc-tray-chip-bg: rgba(0, 112, 186, 0.08);
+  --zhc-panel-bg: #ffffff;
+  --zhc-panel-fg: #1a1a1a;
+  --zhc-danger: #a33;
+  --zhc-ok: #2d5a27;
+}
+
+html[data-zhc-theme="light"] body {
+  color-scheme: light;
+}
+html[data-zhc-theme="dark"] body {
+  color-scheme: dark;
+}
+
+/* Light-first pages → dark theme (high specificity for landings with inline body{}) */
+html[data-zhc-theme="dark"] body,
+html[data-zhc-theme="dark"] body.zhc-themed {
+  background: #0b1220 !important;
+  color: #e2eaf4 !important;
+}
+html[data-zhc-theme="dark"] .panel,
+html[data-zhc-theme="dark"] .card,
+html[data-zhc-theme="dark"] .box,
+html[data-zhc-theme="dark"] .api,
+html[data-zhc-theme="dark"] form.demo,
+html[data-zhc-theme="dark"] form.auth {
+  background: rgba(12, 22, 38, 0.92) !important;
+  border: 1px solid rgba(0, 229, 255, 0.22) !important;
+  color: #e2eaf4 !important;
+}
+html[data-zhc-theme="dark"] .note,
+html[data-zhc-theme="dark"] .tag,
+html[data-zhc-theme="dark"] .hint,
+html[data-zhc-theme="dark"] .muted {
+  color: rgba(190, 220, 245, 0.82) !important;
+}
+html[data-zhc-theme="dark"] input,
+html[data-zhc-theme="dark"] textarea,
+html[data-zhc-theme="dark"] select,
+html[data-zhc-theme="dark"] form input {
+  background: #0a1422 !important;
+  color: #e8f4ff !important;
+  border: 1px solid rgba(0, 229, 255, 0.28) !important;
+}
+html[data-zhc-theme="dark"] a {
+  color: #7ee8ff !important;
+}
+html[data-zhc-theme="dark"] code,
+html[data-zhc-theme="dark"] pre {
+  background: rgba(0, 0, 0, 0.35) !important;
+  color: #b8eaff !important;
+  border-color: rgba(0, 229, 255, 0.2) !important;
+}
+
+/* Tables / section rules — kill light-page #ddd / #eee borders (support Plans, whoami, etc.) */
+html[data-zhc-theme="dark"] h1,
+html[data-zhc-theme="dark"] h2,
+html[data-zhc-theme="dark"] h3 {
+  color: #e8f4ff !important;
+  border-color: rgba(0, 229, 255, 0.25) !important;
+}
+html[data-zhc-theme="dark"] h2 {
+  border-bottom-color: rgba(0, 229, 255, 0.25) !important;
+}
+html[data-zhc-theme="dark"] table,
+html[data-zhc-theme="dark"] table.pricing,
+html[data-zhc-theme="dark"] table.pricing th,
+html[data-zhc-theme="dark"] table.pricing td,
+html[data-zhc-theme="dark"] th,
+html[data-zhc-theme="dark"] td {
+  border-color: rgba(0, 229, 255, 0.28) !important;
+  color: #e2eaf4 !important;
+}
+html[data-zhc-theme="dark"] table.pricing th,
+html[data-zhc-theme="dark"] th {
+  background: rgba(0, 40, 60, 0.55) !important;
+  color: #d8ecff !important;
+}
+html[data-zhc-theme="dark"] table.pricing td,
+html[data-zhc-theme="dark"] td {
+  background: transparent !important;
+}
+html[data-zhc-theme="dark"] hr {
+  border-color: rgba(0, 229, 255, 0.22) !important;
+  background: transparent !important;
+}
+html[data-zhc-theme="dark"] .btn,
+html[data-zhc-theme="dark"] button.btn {
+  /* keep solid CTAs readable; secondary handled below */
+  border-color: transparent !important;
+}
+html[data-zhc-theme="dark"] .btn.secondary {
+  background: rgba(40, 55, 75, 0.95) !important;
+  color: #e8f4ff !important;
+}
+html[data-zhc-theme="dark"] .ok {
+  color: #7fd99a !important;
+}
+html[data-zhc-theme="dark"] .err {
+  color: #f07178 !important;
+}
+html[data-zhc-theme="dark"] details,
+html[data-zhc-theme="dark"] summary {
+  color: #e2eaf4 !important;
+}
+
+/* =====================================================================
+ * LIGHT MODE — full override for dark-first product pages (BB, splash, etc.)
+ * High-specificity + !important so page-level cyan-on-navy rules lose.
+ * ===================================================================== */
+html[data-zhc-theme="light"] {
+  --zhc-light-page: #eef3f8;
+  --zhc-light-ink: #15202b;
+  --zhc-light-muted: #4a5d6e;
+  --zhc-light-card: #ffffff;
+  --zhc-light-border: #c9d4e0;
+  --zhc-light-accent: #0a6ead;
+  --zhc-light-accent-soft: #e6f3fb;
+  --zhc-light-ok: #0d7a4f;
+  --zhc-light-danger: #b4232f;
+  --zhc-light-btn: linear-gradient(135deg, #0d7a5c, #0a5f8f);
+  --zhc-light-btn-secondary: #e8eef4;
+}
+
+html[data-zhc-theme="light"] body {
+  background: var(--zhc-light-page) !important;
+  color: var(--zhc-light-ink) !important;
+  color-scheme: light;
+}
+
+/* Keep #bg canvas fully visible; animation JS paints a light or dark backdrop. */
+html[data-zhc-theme="light"] #bg {
+  opacity: 1 !important;
+  filter: none !important;
+  z-index: 0;
+}
+html[data-zhc-theme="light"] .wrap {
+  color: var(--zhc-light-ink);
+}
+
+/* Splash landing (/ and /dev/) — light theme for service tiles */
+html[data-zhc-theme="light"] .tagline {
+  color: #3a5568 !important;
+}
+html[data-zhc-theme="light"] .details,
+html[data-zhc-theme="light"] .details p {
+  color: #2a3f50 !important;
+}
+html[data-zhc-theme="light"] .details code {
+  background: rgba(255, 255, 255, 0.85) !important;
+  color: #0a4a70 !important;
+  border: 1px solid #c5d4e2;
+  padding: 0.08rem 0.35rem;
+  border-radius: 4px;
+}
+html[data-zhc-theme="light"] .logo,
+html[data-zhc-theme="light"] h1.logo {
+  filter: none !important;
+  text-shadow: 0 2px 24px rgba(10, 110, 173, 0.2) !important;
+}
+html[data-zhc-theme="light"] nav.services a {
+  background: rgba(255, 255, 255, 0.88) !important;
+  border: 1px solid #b8c9d9 !important;
+  color: #0a5f8f !important;
+  box-shadow: 0 2px 12px rgba(15, 40, 70, 0.08) !important;
+  backdrop-filter: blur(8px);
+}
+html[data-zhc-theme="light"] nav.services a:hover,
+html[data-zhc-theme="light"] nav.services a:focus-visible {
+  border-color: #0a6ead !important;
+  color: #063d5c !important;
+  box-shadow: 0 4px 18px rgba(10, 110, 173, 0.2) !important;
+  background: #ffffff !important;
+}
+html[data-zhc-theme="light"] nav.services a strong {
+  color: #5a6e80 !important;
+}
+html[data-zhc-theme="light"] .coming {
+  color: #5a7080 !important;
+}
+html[data-zhc-theme="light"] .pulse {
+  background: #0a8f6a !important;
+  box-shadow: 0 0 8px rgba(10, 143, 106, 0.55) !important;
+}
+/* Splash / canvas pages: body fallback matches anim palette */
+html.zhc-splash-lock[data-zhc-theme="light"] body,
+html[data-zhc-theme="light"] body:has(#bg) {
+  background: #e8f0f7 !important;
+}
+html.zhc-splash-lock[data-zhc-theme="dark"] body,
+html[data-zhc-theme="dark"] body:has(#bg) {
+  background: #030508 !important;
+}
+html[data-zhc-theme="light"] #bg {
+  background-color: #e8f0f7 !important;
+}
+html[data-zhc-theme="dark"] #bg {
+  background-color: #030508 !important;
+}
+
+/* Surfaces */
+html[data-zhc-theme="light"] .card,
+html[data-zhc-theme="light"] .panel,
+html[data-zhc-theme="light"] .box,
+html[data-zhc-theme="light"] form.auth,
+html[data-zhc-theme="light"] form.demo,
+html[data-zhc-theme="light"] .api {
+  background: var(--zhc-light-card) !important;
+  border-color: var(--zhc-light-border) !important;
+  color: var(--zhc-light-ink) !important;
+  box-shadow: 0 1px 3px rgba(15, 40, 70, 0.06);
+  backdrop-filter: none !important;
+}
+
+/* Headings & copy */
+html[data-zhc-theme="light"] h1,
+html[data-zhc-theme="light"] h2,
+html[data-zhc-theme="light"] h3,
+html[data-zhc-theme="light"] .card h2,
+html[data-zhc-theme="light"] .panel h2 {
+  color: var(--zhc-light-ink) !important;
+}
+/* Brand gradient logos (splash + BB): transparent fill + clip — force readable contrast both themes */
+html[data-zhc-theme="light"] h1.logo,
+html[data-zhc-theme="light"] .logo {
+  filter: saturate(1.2) brightness(0.82);
+  -webkit-text-fill-color: transparent;
+}
+html[data-zhc-theme="dark"] h1.logo,
+html[data-zhc-theme="dark"] .logo {
+  filter: none;
+  -webkit-text-fill-color: transparent;
+}
+/* Non-gradient headings must never be invisible on dark */
+html[data-zhc-theme="dark"] h1:not(.logo),
+html[data-zhc-theme="dark"] h2,
+html[data-zhc-theme="dark"] h3 {
+  color: #e2eaf4 !important;
+}
+html[data-zhc-theme="light"] .tag,
+html[data-zhc-theme="light"] .note,
+html[data-zhc-theme="light"] .hint,
+html[data-zhc-theme="light"] .scavenger h3,
+html[data-zhc-theme="light"] .scavenger .hint,
+html[data-zhc-theme="light"] p {
+  color: var(--zhc-light-muted) !important;
+}
+html[data-zhc-theme="light"] label {
+  color: #2a3a4a !important;
+}
+html[data-zhc-theme="light"] a {
+  color: var(--zhc-light-accent) !important;
+}
+html[data-zhc-theme="light"] .signed-in,
+html[data-zhc-theme="light"] .ok,
+html[data-zhc-theme="light"] .okmsg {
+  color: var(--zhc-light-ok) !important;
+}
+html[data-zhc-theme="light"] .err {
+  color: var(--zhc-light-danger) !important;
+}
+html[data-zhc-theme="light"] code,
+html[data-zhc-theme="light"] pre {
+  background: #e8eef4 !important;
+  color: #1a2a3a !important;
+}
+
+/* Form fields */
+html[data-zhc-theme="light"] input,
+html[data-zhc-theme="light"] textarea,
+html[data-zhc-theme="light"] select,
+html[data-zhc-theme="light"] input[type="email"],
+html[data-zhc-theme="light"] input[type="password"],
+html[data-zhc-theme="light"] input[type="text"],
+html[data-zhc-theme="light"] input[type="number"] {
+  background: #fff !important;
+  color: var(--zhc-light-ink) !important;
+  border: 1px solid var(--zhc-light-border) !important;
+}
+html[data-zhc-theme="light"] input:focus,
+html[data-zhc-theme="light"] textarea:focus,
+html[data-zhc-theme="light"] select:focus {
+  border-color: var(--zhc-light-accent) !important;
+  box-shadow: 0 0 0 3px rgba(10, 110, 173, 0.18) !important;
+}
+html[data-zhc-theme="light"] input::placeholder,
+html[data-zhc-theme="light"] textarea::placeholder {
+  color: #8a9bab !important;
+}
+html[data-zhc-theme="light"] input[type="file"] {
+  color: var(--zhc-light-muted) !important;
+}
+
+/* Buttons — product + chrome */
+html[data-zhc-theme="light"] button,
+html[data-zhc-theme="light"] .btn,
+html[data-zhc-theme="light"] button.behavior-btn,
+html[data-zhc-theme="light"] button.reward-btn {
+  background: var(--zhc-light-btn) !important;
+  color: #ffffff !important;
+  border: 1px solid rgba(10, 95, 143, 0.45) !important;
+}
+html[data-zhc-theme="light"] button:hover,
+html[data-zhc-theme="light"] .btn:hover {
+  border-color: var(--zhc-light-accent) !important;
+  filter: brightness(1.05);
+}
+html[data-zhc-theme="light"] button.secondary,
+html[data-zhc-theme="light"] .btn.secondary {
+  background: var(--zhc-light-btn-secondary) !important;
+  color: var(--zhc-light-ink) !important;
+  border: 1px solid var(--zhc-light-border) !important;
+  filter: none;
+}
+html[data-zhc-theme="light"] button.danger {
+  background: #fde8ea !important;
+  color: var(--zhc-light-danger) !important;
+  border: 1px solid rgba(180, 35, 47, 0.35) !important;
+}
+html[data-zhc-theme="light"] button.ghost,
+html[data-zhc-theme="light"] .info-btn {
+  background: transparent !important;
+  color: var(--zhc-light-accent) !important;
+  border: 1px solid var(--zhc-light-border) !important;
+}
+html[data-zhc-theme="light"] button:disabled {
+  opacity: 0.5 !important;
+}
+
+/* Product / theme chrome */
+html[data-zhc-theme="light"] .zhc-app-chrome {
+  background: linear-gradient(to bottom, rgba(238, 243, 248, 0.96) 65%, transparent) !important;
+}
+html[data-zhc-theme="light"] nav.zhc-product-nav button,
+html[data-zhc-theme="light"] nav.app-nav button {
+  background: #ffffff !important;
+  color: var(--zhc-light-ink) !important;
+  border-color: var(--zhc-light-border) !important;
+  box-shadow: 0 1px 2px rgba(15, 40, 70, 0.06) !important;
+}
+html[data-zhc-theme="light"] nav.zhc-product-nav button.active,
+html[data-zhc-theme="light"] nav.app-nav button.active {
+  background: var(--zhc-light-accent-soft) !important;
+  border-color: var(--zhc-light-accent) !important;
+  color: var(--zhc-light-accent) !important;
+  box-shadow: 0 0 0 2px rgba(10, 110, 173, 0.25) !important;
+}
+html[data-zhc-theme="light"] #zhc-theme-toggle {
+  background: #ffffff !important;
+  color: var(--zhc-light-ink) !important;
+  border-color: var(--zhc-light-border) !important;
+}
+
+/* BB dashboard pieces */
+html[data-zhc-theme="light"] .totals .cell {
+  background: #f3f7fb !important;
+  border-color: var(--zhc-light-border) !important;
+}
+html[data-zhc-theme="light"] .totals .big {
+  color: var(--zhc-light-ok) !important;
+}
+html[data-zhc-theme="light"] .totals .lbl {
+  color: var(--zhc-light-muted) !important;
+}
+html[data-zhc-theme="light"] .kid-tabs button {
+  background: #f3f7fb !important;
+  border-color: var(--zhc-light-border) !important;
+  color: var(--zhc-light-ink) !important;
+}
+html[data-zhc-theme="light"] .kid-tabs button.active {
+  background: var(--zhc-light-accent-soft) !important;
+  border-color: var(--zhc-light-accent) !important;
+  color: var(--zhc-light-accent) !important;
+  box-shadow: none !important;
+}
+html[data-zhc-theme="light"] .kid-tabs .bal {
+  color: var(--zhc-light-ok) !important;
+}
+html[data-zhc-theme="light"] .mode-toggle button {
+  background: #f3f7fb !important;
+  border-color: var(--zhc-light-border) !important;
+  color: var(--zhc-light-ink) !important;
+}
+html[data-zhc-theme="light"] .mode-toggle button.active {
+  background: var(--zhc-light-accent-soft) !important;
+  border-color: var(--zhc-light-accent) !important;
+  color: var(--zhc-light-accent) !important;
+}
+html[data-zhc-theme="light"] button.behavior-btn {
+  background: #e8f6f0 !important;
+  color: #0d5c40 !important;
+  border-color: rgba(13, 122, 79, 0.35) !important;
+}
+html[data-zhc-theme="light"] button.reward-btn {
+  background: #f0eaf8 !important;
+  color: #4a3080 !important;
+  border-color: rgba(100, 70, 160, 0.35) !important;
+}
+html[data-zhc-theme="light"] ul.feed li,
+html[data-zhc-theme="light"] .manage-list li {
+  border-bottom-color: #e2e8ef !important;
+  color: var(--zhc-light-ink) !important;
+}
+html[data-zhc-theme="light"] ul.feed .pts {
+  color: var(--zhc-light-ok) !important;
+}
+html[data-zhc-theme="light"] ul.feed .spent {
+  color: #6b4aa0 !important;
+}
+html[data-zhc-theme="light"] ul.feed .when,
+html[data-zhc-theme="light"] ul.feed .who,
+html[data-zhc-theme="light"] .parents {
+  color: var(--zhc-light-muted) !important;
+}
+html[data-zhc-theme="light"] .parents strong {
+  color: var(--zhc-light-ink) !important;
+}
+html[data-zhc-theme="light"] .invite-box {
+  color: var(--zhc-light-ok) !important;
+  background: #f0faf5;
+  border-radius: 8px;
+  padding: 0.45rem 0.6rem !important;
+}
+html[data-zhc-theme="light"] details.help summary {
+  color: var(--zhc-light-accent) !important;
+}
+html[data-zhc-theme="light"] details.help p {
+  color: var(--zhc-light-muted) !important;
+}
+html[data-zhc-theme="light"] .scavenger {
+  border-top-color: #d0d7de !important;
+}
+html[data-zhc-theme="light"] table.pricing th {
+  background: #e8eef4 !important;
+  color: var(--zhc-light-ink) !important;
+}
+html[data-zhc-theme="light"] table.pricing th,
+html[data-zhc-theme="light"] table.pricing td {
+  border-color: var(--zhc-light-border) !important;
+  color: var(--zhc-light-ink) !important;
+}
+
+/* Cookie tray + panel stay readable on light (vars already flipped) */
+html[data-zhc-theme="light"] #zhc-cookie-tray {
+  background: rgba(255, 255, 255, 0.98) !important;
+  border-top-color: var(--zhc-light-border) !important;
+  color: var(--zhc-light-ink) !important;
+  box-shadow: 0 -4px 20px rgba(15, 40, 70, 0.08) !important;
+}
+html[data-zhc-theme="light"] #zhc-cookie-tray button.zhc-cookie-chip {
+  background: var(--zhc-light-accent-soft) !important;
+  color: var(--zhc-light-ink) !important;
+  border-color: var(--zhc-light-border) !important;
+}
+
+/* —— Dev/qa bucket memo: match page theme (overrides deploy inline yellow) —— */
+#zhc-dev-altcha-banner,
+.zhc-bucket-banner {
+  background: rgba(0, 229, 255, 0.1) !important;
+  border: 1px solid rgba(0, 229, 255, 0.38) !important;
+  color: #d8ecff !important;
+  padding: 0.65rem 0.9rem !important;
+  border-radius: 8px !important;
+  margin: 0 0 1rem !important;
+  font-size: 0.88rem !important;
+  line-height: 1.45 !important;
+  text-shadow: none !important;
+  filter: none !important;
+  opacity: 1 !important;
+}
+#zhc-dev-altcha-banner strong,
+.zhc-bucket-banner strong {
+  color: #7ee8ff !important;
+  font-weight: 650;
+}
+#zhc-dev-altcha-banner code,
+.zhc-bucket-banner code {
+  background: rgba(0, 0, 0, 0.35) !important;
+  color: #b8eaff !important;
+  padding: 0.08rem 0.3rem;
+  border-radius: 3px;
+  font-size: 0.82em;
+}
+html[data-zhc-theme="light"] #zhc-dev-altcha-banner,
+html[data-zhc-theme="light"] .zhc-bucket-banner {
+  background: #e8f3fb !important;
+  border-color: #9bc4e0 !important;
+  color: #1a2a3a !important;
+}
+html[data-zhc-theme="light"] #zhc-dev-altcha-banner strong,
+html[data-zhc-theme="light"] .zhc-bucket-banner strong {
+  color: #0a5f8f !important;
+}
+html[data-zhc-theme="light"] #zhc-dev-altcha-banner code,
+html[data-zhc-theme="light"] .zhc-bucket-banner code {
+  background: #dceaf5 !important;
+  color: #0a2a40 !important;
+}
+
+/*
+ * Scroll: product pages must scroll vertically on mobile.
+ * Splash pages opt into .zhc-splash-lock (full-viewport canvas).
+ */
+html:not(.zhc-splash-lock) {
+  height: auto;
+  min-height: 100%;
+  overflow-x: clip;
+  overflow-y: auto;
+  -webkit-overflow-scrolling: touch;
+}
+html:not(.zhc-splash-lock) body {
+  min-height: 100%;
+  height: auto !important;
+  overflow-x: clip !important;
+  overflow-y: visible !important;
+  padding-bottom: 4.25rem !important; /* room for cookie chips */
+}
+html.zhc-splash-lock,
+html.zhc-splash-lock body {
+  height: 100%;
+  overflow: hidden !important;
+  padding-bottom: 4.25rem !important;
+}
+
+/* —— Services menu (left of Dashboard) —— */
+.zhc-services-menu {
+  position: relative;
+  flex: 0 0 auto;
+  margin: 0;
+}
+button.zhc-services-toggle {
+  display: inline-flex !important;
+  align-items: center;
+  gap: 0.35rem;
+  flex: 0 0 auto !important;
+  min-width: auto !important;
+  margin: 0 !important;
+  padding: 0.5rem 0.75rem !important;
+  background: var(--zhc-tray-bg);
+  border: 1px solid var(--zhc-tray-border);
+  border-radius: 999px;
+  color: var(--zhc-tray-fg);
+  font: 0.92rem/1.2 system-ui, -apple-system, "Segoe UI", sans-serif !important;
+  font-weight: 650 !important;
+  cursor: pointer;
+  box-shadow: 0 1px 6px rgba(0, 0, 0, 0.12);
+}
+button.zhc-services-toggle:hover,
+button.zhc-services-toggle:focus-visible,
+.zhc-services-menu.open button.zhc-services-toggle {
+  border-color: var(--zhc-tray-accent);
+  box-shadow: 0 0 0 2px var(--zhc-tray-accent);
+  outline: none;
+}
+.zhc-services-ico {
+  font-size: 1.05rem;
+  line-height: 1;
+}
+.zhc-services-panel {
+  position: absolute;
+  top: calc(100% + 0.35rem);
+  left: 0;
+  z-index: 99995;
+  min-width: 12.5rem;
+  max-width: min(18rem, 90vw);
+  max-height: min(70vh, 28rem);
+  overflow: auto;
+  padding: 0.4rem;
+  background: var(--zhc-panel-bg);
+  color: var(--zhc-panel-fg);
+  border: 1px solid var(--zhc-tray-border);
+  border-radius: 12px;
+  box-shadow: 0 10px 28px rgba(0, 0, 0, 0.28);
+}
+.zhc-services-panel a.zhc-services-link {
+  display: block;
+  padding: 0.45rem 0.65rem;
+  border-radius: 8px;
+  color: var(--zhc-panel-fg);
+  text-decoration: none;
+  font: 0.9rem/1.3 system-ui, -apple-system, "Segoe UI", sans-serif;
+  font-weight: 560;
+}
+.zhc-services-panel a.zhc-services-link:hover,
+.zhc-services-panel a.zhc-services-link:focus-visible {
+  background: rgba(126, 232, 255, 0.12);
+  outline: none;
+}
+.zhc-services-panel a.zhc-services-link.current {
+  border-left: 3px solid var(--zhc-tray-accent);
+  font-weight: 700;
+}
+#zhc-theme-bar .zhc-services-menu {
+  pointer-events: auto;
+}
+
+/* —— Product chrome: nav (left) + theme (right), sticky content width —— */
+.zhc-app-chrome,
+#zhc-theme-bar {
+  position: sticky;
+  top: 0;
+  z-index: 99980;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+  width: 100%;
+  max-width: var(--zhc-content-max);
+  margin: 0 auto;
+  padding: 0.5rem 1rem 0.4rem;
+  box-sizing: border-box;
+  background: linear-gradient(
+    to bottom,
+    var(--zhc-tray-bg) 70%,
+    transparent
+  );
+  backdrop-filter: blur(10px);
+}
+/* Theme-only fallback bar (no product nav on page) */
+#zhc-theme-bar:not(.zhc-app-chrome) {
+  justify-content: flex-end;
+  pointer-events: none;
+  background: transparent;
+  backdrop-filter: none;
+}
+#zhc-theme-bar:not(.zhc-app-chrome) > * {
+  pointer-events: auto;
+}
+#zhc-theme-slot {
+  flex: 0 0 auto;
+  margin-left: auto;
+}
+nav.zhc-product-nav,
+nav.app-nav {
+  display: flex;
+  flex: 1 1 auto;
+  gap: 0.4rem;
+  flex-wrap: wrap;
+  min-width: 0;
+  margin: 0;
+}
+nav.zhc-product-nav button,
+nav.app-nav button {
+  flex: 1 1 auto;
+  min-width: 4.75rem;
+  margin: 0 !important;
+  padding: 0.5rem 0.65rem !important;
+  background: var(--zhc-tray-bg);
+  border: 1px solid var(--zhc-tray-border);
+  border-radius: 999px;
+  color: var(--zhc-tray-fg);
+  font: 0.92rem/1.2 system-ui, -apple-system, "Segoe UI", sans-serif !important;
+  font-weight: 650 !important;
+  cursor: pointer;
+  box-shadow: 0 1px 6px rgba(0, 0, 0, 0.12);
+}
+nav.zhc-product-nav button.active,
+nav.app-nav button.active {
+  border-color: var(--zhc-tray-accent);
+  box-shadow: 0 0 0 2px var(--zhc-tray-accent);
+  color: var(--zhc-tray-fg);
+}
+#zhc-theme-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+  border: 1px solid var(--zhc-tray-border);
+  background: var(--zhc-tray-bg);
+  color: var(--zhc-tray-fg);
+  border-radius: 999px;
+  padding: 0.35rem 0.75rem;
+  cursor: pointer;
+  font: 0.8rem/1.2 system-ui, -apple-system, "Segoe UI", sans-serif;
+  font-weight: 600;
+  box-shadow: 0 2px 12px rgba(0, 0, 0, 0.18);
+  backdrop-filter: blur(8px);
+  white-space: nowrap;
+}
+#zhc-theme-toggle:hover,
+#zhc-theme-toggle:focus-visible {
+  border-color: var(--zhc-tray-accent);
+  outline: none;
+  box-shadow: 0 0 0 2px var(--zhc-tray-accent);
+}
+#zhc-theme-toggle .zhc-theme-ico {
+  font-size: 1.05rem;
+  line-height: 1;
+}
+
+/* —— Cookie tray: chips only (details live in the panel) —— */
+#zhc-cookie-tray {
+  position: fixed;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  z-index: 99990;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.5rem;
+  padding: 0.45rem 0.75rem;
+  min-height: 2.75rem;
+  background: var(--zhc-tray-bg);
+  border-top: 2px solid var(--zhc-tray-border);
+  color: var(--zhc-tray-fg);
+  font: 0.8rem/1.35 system-ui, -apple-system, "Segoe UI", sans-serif;
+  backdrop-filter: blur(10px);
+  box-sizing: border-box;
+  box-shadow: 0 -4px 24px rgba(0, 0, 0, 0.25);
+}
+#zhc-cookie-tray .zhc-tray-icons {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.45rem;
+  align-items: center;
+  justify-content: center;
+}
+#zhc-cookie-tray button.zhc-cookie-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+  border: 1px solid var(--zhc-tray-border);
+  background: var(--zhc-tray-chip-bg);
+  color: var(--zhc-tray-fg);
+  border-radius: 999px;
+  padding: 0.4rem 0.8rem;
+  cursor: pointer;
+  font: 0.82rem/1.2 system-ui, -apple-system, "Segoe UI", sans-serif;
+  font-weight: 600;
+  line-height: 1.2;
+  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.12);
+}
+#zhc-cookie-tray button.zhc-cookie-chip:hover,
+#zhc-cookie-tray button.zhc-cookie-chip:focus-visible {
+  border-color: var(--zhc-tray-accent);
+  outline: none;
+  box-shadow: 0 0 0 2px var(--zhc-tray-accent);
+}
+#zhc-cookie-tray button.zhc-cookie-chip .zhc-cookie-glyph {
+  font-size: 1.15rem;
+  line-height: 1;
+}
+#zhc-cookie-tray button.zhc-cookie-chip.absent {
+  opacity: 0.55;
+}
+#zhc-cookie-tray button.zhc-legal-chip {
+  font-size: 0.78rem;
+  letter-spacing: 0.04em;
+  font-weight: 700;
+  gap: 0.3rem;
+}
+#zhc-cookie-tray button.zhc-legal-chip .zhc-cookie-glyph {
+  font-size: 1.05rem;
+  line-height: 1;
+}
+/* Wide dual-pane: official (left) + plain English (right), one scroll = lock-step */
+#zhc-cookie-panel.zhc-legal-panel {
+  width: min(56rem, calc(100vw - 0.75rem));
+  max-height: min(88vh, 52rem);
+  bottom: 3.2rem;
+}
+#zhc-cookie-panel .zhc-legal-body {
+  font-size: 0.86rem;
+  line-height: 1.5;
+  max-height: min(72vh, 42rem);
+  overflow: auto;
+  margin: 0.35rem 0 0.75rem;
+  padding-right: 0.15rem;
+  scroll-behavior: auto;
+}
+#zhc-cookie-panel .zhc-legal-body h1 {
+  font-size: 1.15rem;
+  margin: 0 0 0.35rem;
+}
+#zhc-cookie-panel .zhc-legal-body h2 {
+  font-size: 0.95rem;
+  margin: 0 0 0.35rem;
+}
+#zhc-cookie-panel .zhc-legal-body .draft {
+  font-size: 0.8rem;
+  background: rgba(230, 194, 0, 0.12);
+  border: 1px solid rgba(230, 194, 0, 0.45);
+  padding: 0.5rem 0.65rem;
+  border-radius: 8px;
+  margin: 0.5rem 0 0.75rem;
+}
+#zhc-cookie-panel .zhc-legal-body .meta {
+  font-size: 0.8rem;
+  opacity: 0.8;
+}
+#zhc-cookie-panel a.zhc-legal-open {
+  display: inline-block;
+  font: inherit;
+  padding: 0.4rem 0.7rem;
+  border-radius: 6px;
+  border: 1px solid var(--zhc-tray-border);
+  color: var(--zhc-panel-fg);
+  text-decoration: none;
+}
+#zhc-cookie-panel .zhc-legal-split-hint {
+  font-size: 0.78rem;
+  line-height: 1.35;
+  opacity: 0.85;
+  margin: 0.15rem 0 0.35rem;
+}
+
+/* Dual-column rows: table-like alignment, single scroll parent */
+.zhc-legal-split {
+  display: block;
+  width: 100%;
+}
+.zhc-legal-col-labels {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 0.65rem 1rem;
+  position: sticky;
+  top: 0;
+  z-index: 2;
+  padding: 0.4rem 0 0.5rem;
+  margin: 0 0 0.25rem;
+  background: var(--zhc-panel-bg, #1a1d24);
+  border-bottom: 1px solid var(--zhc-tray-border, rgba(255, 255, 255, 0.12));
+  font-size: 0.72rem;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  opacity: 0.9;
+}
+.zhc-legal-col-labels .zhc-legal-lab-plain {
+  color: var(--zhc-tray-accent, #7eb8ff);
+}
+.zhc-legal-row {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 0.65rem 1rem;
+  align-items: start;
+  padding: 0.85rem 0;
+  border-bottom: 1px solid var(--zhc-tray-border, rgba(128, 128, 128, 0.25));
+}
+.zhc-legal-row:last-child {
+  border-bottom: none;
+}
+.zhc-legal-official,
+.zhc-legal-plain {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+.zhc-legal-official p,
+.zhc-legal-plain p {
+  margin: 0 0 0.5rem;
+}
+.zhc-legal-official ul,
+.zhc-legal-plain ul {
+  margin: 0.25rem 0 0.5rem;
+  padding-left: 1.2em;
+}
+.zhc-legal-plain {
+  font-size: 0.94em;
+  line-height: 1.45;
+  padding-left: 0.75rem;
+  border-left: 2px solid var(--zhc-tray-accent, #7eb8ff);
+  opacity: 0.98;
+}
+.zhc-legal-plain h2 {
+  color: var(--zhc-tray-accent, #7eb8ff);
+  font-weight: 600;
+}
+.zhc-legal-plain .zhc-plain-note {
+  font-size: 0.78em;
+  opacity: 0.75;
+  font-style: italic;
+  margin-bottom: 0.65rem;
+}
+@media (max-width: 640px) {
+  #zhc-cookie-panel.zhc-legal-panel {
+    width: calc(100vw - 0.5rem);
+  }
+  .zhc-legal-col-labels,
+  .zhc-legal-row {
+    grid-template-columns: 1fr;
+  }
+  .zhc-legal-plain {
+    border-left: none;
+    border-top: 2px dashed var(--zhc-tray-accent, #7eb8ff);
+    padding-left: 0;
+    padding-top: 0.55rem;
+    margin-top: 0.25rem;
+  }
+  .zhc-legal-col-labels .zhc-legal-lab-plain {
+    display: none;
+  }
+}
+
+/* Detail panel */
+#zhc-cookie-panel-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 99991;
+  background: rgba(0, 0, 0, 0.5);
+  display: none;
+}
+#zhc-cookie-panel-backdrop.open {
+  display: block;
+}
+#zhc-cookie-panel {
+  position: fixed;
+  left: 50%;
+  bottom: 3.6rem;
+  transform: translateX(-50%);
+  z-index: 99992;
+  width: min(28rem, calc(100vw - 1.25rem));
+  max-height: min(70vh, 32rem);
+  overflow: auto;
+  background: var(--zhc-panel-bg);
+  color: var(--zhc-panel-fg);
+  border: 1px solid var(--zhc-tray-border);
+  border-radius: 12px;
+  box-shadow: 0 12px 40px rgba(0, 0, 0, 0.4);
+  padding: 1rem 1.1rem 1.1rem;
+  display: none;
+  font: 0.88rem/1.45 system-ui, -apple-system, "Segoe UI", sans-serif;
+}
+#zhc-cookie-panel.open {
+  display: block;
+}
+#zhc-cookie-panel h2 {
+  font-size: 1rem;
+  margin: 0 0 0.35rem;
+  padding-right: 1.5rem;
+}
+#zhc-cookie-panel .zhc-why {
+  font-size: 0.86rem;
+  margin: 0 0 0.75rem;
+  padding: 0.55rem 0.65rem;
+  border-radius: 8px;
+  border-left: 3px solid var(--zhc-tray-accent);
+  background: rgba(0, 112, 186, 0.08);
+}
+html[data-zhc-theme="dark"] #zhc-cookie-panel .zhc-why {
+  background: rgba(0, 229, 255, 0.08);
+}
+#zhc-cookie-panel dl {
+  margin: 0 0 0.85rem;
+  display: grid;
+  grid-template-columns: 7.5rem 1fr;
+  gap: 0.35rem 0.65rem;
+  font-size: 0.82rem;
+}
+#zhc-cookie-panel dt {
+  color: var(--zhc-tray-muted);
+  font-weight: 600;
+}
+#zhc-cookie-panel dd {
+  margin: 0;
+  word-break: break-word;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 0.78rem;
+}
+#zhc-cookie-panel .zhc-panel-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.4rem;
+  margin-top: 0.5rem;
+}
+#zhc-cookie-panel button,
+#zhc-cookie-panel .zhc-theme-opts button {
+  font: inherit;
+  cursor: pointer;
+  border-radius: 6px;
+  border: 1px solid var(--zhc-tray-border);
+  background: transparent;
+  color: var(--zhc-panel-fg);
+  padding: 0.4rem 0.7rem;
+}
+#zhc-cookie-panel button.primary {
+  background: var(--zhc-tray-accent);
+  color: #041018;
+  border-color: transparent;
+  font-weight: 600;
+}
+html[data-zhc-theme="light"] #zhc-cookie-panel button.primary {
+  color: #fff;
+}
+#zhc-cookie-panel button.danger {
+  color: var(--zhc-danger);
+  border-color: var(--zhc-danger);
+}
+#zhc-cookie-panel button:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+#zhc-cookie-panel .zhc-theme-opts {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.35rem;
+  margin: 0.35rem 0 0.75rem;
+}
+#zhc-cookie-panel .zhc-theme-opts button.active {
+  border-color: var(--zhc-tray-accent);
+  box-shadow: inset 0 0 0 1px var(--zhc-tray-accent);
+}
+#zhc-cookie-panel .zhc-msg {
+  font-size: 0.8rem;
+  margin: 0.4rem 0 0;
+  min-height: 1.1em;
+}
+#zhc-cookie-panel .zhc-msg.ok { color: var(--zhc-ok); }
+#zhc-cookie-panel .zhc-msg.err { color: var(--zhc-danger); }
+#zhc-cookie-panel .zhc-close {
+  position: absolute;
+  top: 0.45rem;
+  right: 0.55rem;
+  border: none;
+  background: transparent;
+  font-size: 1.15rem;
+  line-height: 1;
+  padding: 0.2rem 0.4rem;
+  color: var(--zhc-tray-muted);
+  cursor: pointer;
+}
+
+@media (max-width: 520px) {
+  .zhc-app-chrome,
+  #zhc-theme-bar {
+    max-width: none;
+    padding-left: 0.65rem;
+    padding-right: 0.65rem;
+  }
+  nav.zhc-product-nav button,
+  nav.app-nav button {
+    font-size: 0.86rem !important;
+    padding: 0.48rem 0.45rem !important;
+    min-width: 0;
+  }
+  #zhc-cookie-tray {
+    padding: 0.4rem 0.55rem;
+  }
+  html:not(.zhc-splash-lock) body,
+  html.zhc-splash-lock body {
+    padding-bottom: 4.5rem !important;
+  }
+}

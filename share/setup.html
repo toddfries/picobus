@@ -1,0 +1,225 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="picobus-cookie" content="__COOKIE__">
+  <title>Create account — __PRODUCT__</title>
+  <script>
+  (function () {
+    try {
+      var meta = document.querySelector('meta[name="picobus-cookie"]');
+      var prefix = (meta && meta.content) ? meta.content : 'PICOBUS';
+      var re = new RegExp('(?:^|; )' + prefix + '_THEME_PROD=([^;]*)');
+      var m = document.cookie.match(re);
+      var v = m ? decodeURIComponent(m[1]) : 'system';
+      var dark = v === 'dark' || (v === 'system' && window.matchMedia && matchMedia('(prefers-color-scheme: dark)').matches);
+      document.documentElement.setAttribute('data-zhc-theme', dark ? 'dark' : 'light');
+      document.documentElement.setAttribute('data-zhc-theme-pref', v);
+    } catch (e) {}
+  })();
+  </script>
+  <link rel="stylesheet" href="/shared/zhc-prefs.css">
+  <style>
+    body { font-family: system-ui, sans-serif; max-width: 520px; margin: 2rem auto; padding: 0 1rem; line-height: 1.55; color: #1a1a1a; }
+    h1 { font-size: 1.4rem; margin-bottom: 0.25rem; }
+    .note { font-size: 0.88rem; color: #444; }
+    .panel { background: #f7f7f7; padding: 1rem 1.25rem; border-radius: 8px; margin: 1rem 0; border: 1px solid #e0e0e0; }
+    label { display: block; margin: 0.5rem 0 0.2rem; font-weight: 600; font-size: 0.9rem; }
+    input { width: 100%; max-width: 100%; padding: 0.45rem; box-sizing: border-box; }
+    .btn { display: inline-block; background: #0070ba; color: #fff; padding: 0.55rem 1.1rem; border: none; border-radius: 6px; cursor: pointer; font: inherit; margin: 0.35rem 0.35rem 0 0; }
+    .btn:disabled { opacity: 0.55; cursor: not-allowed; }
+    .err { color: #a33; font-size: 0.88rem; }
+    .ok { color: #2d5a27; font-weight: 600; }
+    #altcha-wrap { margin: 0.65rem 0 0.25rem; }
+    .scavenger {
+      margin: 1rem 0 0.5rem; padding-top: 0.75rem;
+      border-top: 1px dashed #bbb;
+    }
+    .scavenger h3 {
+      font-size: 0.82rem; font-weight: 600; letter-spacing: 0.02em;
+      color: #555; margin: 0 0 0.5rem; text-transform: none;
+    }
+    .scavenger .hint { font-size: 0.8rem; color: #666; margin: 0.25rem 0 0.5rem; }
+    nav.footer-links { font-size: 0.88rem; margin-top: 1.5rem; }
+    nav.footer-links a { margin-right: 0.75rem; }
+    .zhc-product-section.hidden { display: none !important; }
+  </style>
+</head>
+<body>
+  <header class="zhc-app-chrome" id="zhc-app-chrome">
+    <nav class="zhc-product-nav" id="app-nav" aria-label="Main">
+      <button type="button" id="nav-dashboard" class="active" data-sec="dashboard">Dashboard</button>
+      <button type="button" id="nav-account" data-sec="account">Account</button>
+    </nav>
+    <div id="zhc-theme-slot"></div>
+  </header>
+
+  <h1>Create account</h1>
+  <p class="note">One operator for this crew. Complete ALTCHA under the password, then LLM access.</p>
+
+  <div id="sec-dashboard" class="zhc-product-section">
+  <div class="panel" id="auth-form-panel">
+    <p class="note">Username and password. New accounts also complete the crew keys below.</p>
+    <form class="auth" id="f" onsubmit="return false">
+      <label for="auth-user">Username</label>
+      <input type="text" id="auth-user" name="user" autocomplete="username" required pattern="[A-Za-z][A-Za-z0-9._-]{1,31}">
+      <label for="auth-password">Password</label>
+      <input type="password" id="auth-password" name="password" autocomplete="new-password" required minlength="8">
+
+      <div id="altcha-wrap">
+        <altcha-widget id="altcha-widget" name="altcha" challengeurl="/api/setup/challenge" auto="off" hidefooter></altcha-widget>
+        <p id="zhc-altcha-status" class="note">ALTCHA: waiting for widget…</p>
+      </div>
+
+      <div class="scavenger" id="scavenger-hunt">
+        <h3>Crew keys (signup only)</h3>
+        <label for="llm_base">LLM HTTP URL</label>
+        <input type="url" id="llm_base" name="llm_base" value="https://openrouter.ai/api/v1">
+        <p class="hint">OpenAI-compatible. Default is OpenRouter.</p>
+        <label for="llm_key">CEO API key</label>
+        <input type="password" id="llm_key" name="llm_key" autocomplete="off" required>
+        <p class="hint">Shared with every agent until a management key (or per-agent keys) exists.</p>
+        <label for="mgmt_key">OpenRouter management key (optional)</label>
+        <input type="password" id="mgmt_key" name="mgmt_key" autocomplete="off">
+        <p class="hint">Lets the CEO mint a key per agent. Leave empty to share the CEO key.</p>
+      </div>
+
+      <button type="button" class="btn" id="btn-continue" disabled>Continue</button>
+      <p id="auth-error" class="err" style="display:none"></p>
+    </form>
+  </div>
+  </div>
+
+  <div id="sec-account" class="zhc-product-section hidden">
+  <div class="panel" id="account-bar">
+    <p><span class="ok" id="account-email">Not signed in</span></p>
+    <p class="note">Finish Create account on Dashboard. Later: Sign in with X, Google, or Apple.</p>
+  </div>
+  </div>
+
+  <nav class="footer-links">
+    <a href="/">Home</a>
+    <a href="/account/">Account</a>
+  </nav>
+
+  <script src="/shared/altcha-http-shim.js"></script>
+  <script src="/shared/altcha-widget-v1.min.js" defer></script>
+  <script src="/shared/crew-prefs.js" defer></script>
+  <script>
+(function () {
+  var altchaPayload = '';
+  function $(id) { return document.getElementById(id); }
+  function showErr(msg) {
+    var el = $('auth-error');
+    if (!msg) { el.style.display = 'none'; el.textContent = ''; return; }
+    el.textContent = msg; el.style.display = 'block';
+  }
+  function asJson(r) {
+    var ct = r.headers.get('content-type') || '';
+    if (ct.indexOf('json') === -1) {
+      throw new Error('setup API returned HTML — hub/httpd is not serving JSON on this path');
+    }
+    return r.json();
+  }
+  function syncAltcha() {
+    var w = $('altcha-widget');
+    if (w && w.value) altchaPayload = w.value;
+  }
+  function altchaResponse() {
+    syncAltcha();
+    if (altchaPayload) return altchaPayload;
+    var el = document.querySelector('input[name="altcha"]');
+    return el && el.value ? el.value : '';
+  }
+  function updateContinue() {
+    var btn = $('btn-continue');
+    if (btn) btn.disabled = !(altchaPayload || altchaResponse());
+  }
+  function setStatus(msg) {
+    var s = $('zhc-altcha-status');
+    if (s) s.textContent = msg ? ('ALTCHA: ' + msg) : '';
+    updateContinue();
+  }
+  function bindAltcha(w) {
+    if (!w || w._bound) return;
+    w._bound = true;
+    w.addEventListener('verified', function (ev) {
+      altchaPayload = (ev.detail && ev.detail.payload) || '';
+      setStatus(altchaPayload ? 'verified' : 'verified empty');
+    });
+    w.addEventListener('statechange', function (ev) {
+      if (!ev.detail) return;
+      if (ev.detail.state === 'verified' && ev.detail.payload) {
+        altchaPayload = ev.detail.payload;
+        setStatus('verified');
+      } else if (ev.detail.state === 'verifying') {
+        setStatus('solving…');
+      } else if (ev.detail.state === 'error' || ev.detail.state === 'expired') {
+        altchaPayload = '';
+        setStatus(ev.detail.state);
+      }
+    });
+  }
+  function showAuthSection(name) {
+    var dash = $('sec-dashboard');
+    var prof = $('sec-account');
+    if (dash) dash.classList.toggle('hidden', name !== 'dashboard');
+    if (prof) prof.classList.toggle('hidden', name !== 'account');
+    var nd = $('nav-dashboard');
+    var np = $('nav-account');
+    if (nd) nd.classList.toggle('active', name === 'dashboard');
+    if (np) np.classList.toggle('active', name === 'account');
+  }
+  if ($('nav-dashboard')) $('nav-dashboard').onclick = function () { showAuthSection('dashboard'); };
+  if ($('nav-account')) $('nav-account').onclick = function () { showAuthSection('account'); };
+
+  $('btn-continue').onclick = function () {
+    showErr('');
+    if (!altchaResponse()) {
+      showErr('Complete the human check under your password first.');
+      return;
+    }
+    var btn = $('btn-continue');
+    btn.disabled = true;
+    var body = {
+      user: $('auth-user').value,
+      password: $('auth-password').value,
+      llm_base: $('llm_base').value,
+      llm_key: $('llm_key').value,
+      mgmt_key: $('mgmt_key').value,
+      altcha: altchaResponse()
+    };
+    fetch('/api/setup', {
+      method: 'POST',
+      credentials: 'same-origin',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body)
+    }).then(function (r) {
+      var ct = r.headers.get('content-type') || '';
+      if (ct.indexOf('json') === -1) {
+        throw new Error('setup API returned HTML (HTTP ' + r.status + ') — hub is down or httpd 500');
+      }
+      return r.json().then(function (j) {
+        if (!r.ok || !j.ok) throw new Error(j.error || ('setup failed (' + r.status + ')'));
+      });
+    }).then(function () { location.href = '/'; })
+    .catch(function (e) {
+      showErr(String(e && e.message ? e.message : e));
+      btn.disabled = false;
+      updateContinue();
+    });
+  };
+
+  if (window.customElements && customElements.whenDefined) {
+    customElements.whenDefined('altcha-widget').then(function () {
+      bindAltcha($('altcha-widget'));
+      setStatus('click the checkbox');
+    });
+  } else {
+    setStatus('widget failed to load');
+  }
+})();
+  </script>
+</body>
+</html>

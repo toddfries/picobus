@@ -1,0 +1,22 @@
+#!/bin/ksh
+# rc wrapper: env + exec picobus (the process rcctl tracks).
+[ -f /etc/picobus.conf ] && . /etc/picobus.conf
+export HUB_SOCK=${HUB_SOCK:-/var/run/picoclaw/hub.sock}
+export FCGI_SOCK=${FCGI_SOCK:-/var/www/run/picoclaw/fcgi.sock}
+export PICOBUS_STATE=${PICOBUS_STATE:-/var/picobus}
+export HUB_LOG=${HUB_LOG:-$PICOBUS_STATE/hub-events.ndjson}
+export CHAT_LOG=${CHAT_LOG:-$PICOBUS_STATE/chat.ndjson}
+export FILE_DIR=${FILE_DIR:-$PICOBUS_STATE/files}
+export SETUP_FILE=${SETUP_FILE:-$PICOBUS_STATE/setup.json}
+export SECRETS_DIR=${SECRETS_DIR:-$PICOBUS_STATE/secrets}
+export SHARE_DIR=${SHARE_DIR:-/usr/local/share/picobus}
+export PICOCLAW_HOME=${PICOCLAW_HOME:-${HOME:-/root}/.picoclaw}
+export PICOBUS_PRODUCT="${PICOBUS_PRODUCT:-picobus}"
+export PICOBUS_COOKIE="${PICOBUS_COOKIE:-PICOBUS}"
+if [ -n "${PICOBUS_LLM_ALIAS:-}" ]; then
+	export PICOBUS_LLM_ALIAS
+fi
+mkdir -p /var/run/picoclaw /var/www/run/picoclaw \
+	"$PICOBUS_STATE/files" "$SECRETS_DIR"
+rm -f "$HUB_SOCK" "$FCGI_SOCK"
+exec /usr/local/sbin/picobus

@@ -1,0 +1,12 @@
+@bin sbin/picobus
+@bin bin/hub-bridge.pl
+@rcscript ${RCDIR}/picobus
+share/picobus/setup.html
+share/picobus/shared/ORIGIN
+share/picobus/shared/altcha-widget-v1.min.js
+share/picobus/shared/crew-prefs.js
+share/picobus/shared/altcha-http-shim.js
+share/picobus/shared/zhc-prefs.css
+share/examples/picobus/picobus.conf
+@sample ${SYSCONFDIR}/picobus.conf
+share/examples/picobus/httpd.conf

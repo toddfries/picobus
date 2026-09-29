@@ -1,0 +1,14 @@
+altcha-widget-v1.min.js
+  ALTCHA widget 0.2.0 (MIT). Same file ZHC serves at /shared/altcha-widget-v1.min.js.
+
+zhc-prefs.css
+  Appearance crib from zhc.fdh.bz /shared/zhc-prefs.css (Todd). Selectors stay
+  data-zhc-theme so the chrome matches signup. Cookie prefix comes from
+  the picobus-cookie meta tag (default PICOBUS).
+
+crew-prefs.js
+  Theme toggle + cookie tray. Cookie {PREFIX}_THEME_{PROD|DEV|QA}. No phone-home.
+
+altcha-http-shim.js
+  crypto.subtle SHA-256 polyfill + disable Workers on plain HTTP so the
+  official widget can solve on the LAN demo (not a secure context).

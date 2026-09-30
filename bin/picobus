@@ -1760,6 +1760,22 @@ body {
   font:12.5px/1.35 ui-monospace,Menlo,monospace;
   background:#2b2d31; padding:0 .3em; border-radius:3px;
 }
+.msg .body pre {
+  margin:0 0 .55em; padding:8px 10px; overflow-x:auto; max-width:100%;
+  background:#2b2d31; border-radius:6px;
+}
+.msg .body pre code {
+  display:block; background:transparent; padding:0; white-space:pre;
+}
+.msg .body .md-table { overflow-x:auto; max-width:100%; margin:0 0 .55em; }
+.msg .body table { border-collapse:collapse; font-size:13px; }
+.msg .body th, .msg .body td {
+  border:1px solid var(--line); padding:4px 8px; vertical-align:top;
+  text-align:left;
+}
+.msg .body th { font-weight:700; color:var(--head); }
+.msg .body th.c, .msg .body td.c { text-align:center; }
+.msg .body th.r, .msg .body td.r { text-align:right; }
 .msg .body strong { font-weight:700; }
 .msg.sys { color:var(--sys); font-size:13px; }
 .msg.sys .ts { margin-left:8px; }
@@ -1812,7 +1828,9 @@ html[data-zhc-theme="light"] .props {
   background:#fff; border-color:var(--line); color:var(--text);
 }
 html[data-zhc-theme="light"] .msg .body code,
+html[data-zhc-theme="light"] .msg .body pre,
 html[data-zhc-theme="light"] .filechip { background:#e3e5e8; }
+html[data-zhc-theme="light"] .msg .body pre code { background:transparent; }
 html[data-zhc-theme="light"] .filechip a.name { color:#0b57d0; }
 html[data-zhc-theme="light"] .transcript::-webkit-scrollbar-thumb,
 html[data-zhc-theme="light"] #channels::-webkit-scrollbar-thumb { background:#c4c6cc; }
@@ -1867,7 +1885,8 @@ html[data-zhc-theme="light"] #channels::-webkit-scrollbar-thumb { background:#c4
     });
   }
   // Chat markdown is a closed set of tags. Escape first so a message cannot
-  // introduce HTML. A marker that does not pair stays as text.
+  // introduce HTML. Fences and pipe tables emit only tags this page builds.
+  // A marker that does not pair stays as text.
   function inlineMd(text) {
     var s = esc(text).replace(/\u0000/g, "");
     var codes = [];
@@ -1885,7 +1904,7 @@ html[data-zhc-theme="light"] #channels::-webkit-scrollbar-thumb { background:#c4
     return s;
   }
   function renderMd(src) {
-    var lines = String(src == null ? "" : src).replace(/\u0000/g, "").replace(/\r\n/g, "\n").replace(/\r/g, "\n").split("\n");
+    var lines = String(src == null ? "" : src).replace(/\u0000/g, "").replace(/\u0001/g, "").replace(/\r\n/g, "\n").replace(/\r/g, "\n").split("\n");
     var html = "";
     var para = [];
     var i = 0;
@@ -1901,9 +1920,113 @@ html[data-zhc-theme="light"] #channels::-webkit-scrollbar-thumb { background:#c4
       if (!m || m[1].length > 6) return null;
       return { n: +m[1], t: m[2] };
     }
+    function fenceOpen(line) {
+      var m = /^ {0,3}(`{3,})([^`]*)[ \t]*$/.exec(line);
+      if (!m) return null;
+      var lang = m[2].replace(/^[ \t]+|[ \t]+$/g, "").split(/[ \t]/)[0] || "";
+      return { n: m[1].length, lang: lang };
+    }
+    function fenceClose(line, n) {
+      var m = /^ {0,3}(`{3,})[ \t]*$/.exec(line);
+      return !!(m && m[1].length >= n);
+    }
+    function fenceHtml(body, lang) {
+      var cls = "";
+      if (/^[A-Za-z0-9_+#.-]{1,32}$/.test(lang)) cls = " class=\"language-" + lang + "\"";
+      return "<pre><code" + cls + ">" + esc(body) + "</code></pre>";
+    }
+    function splitRow(line) {
+      var s = line.replace(/^[ \t]+|[ \t]+$/g, "");
+      if (s.indexOf("|") < 0) return null;
+      var codes = [];
+      s = s.replace(/`[^`\n]*`/g, function (m) {
+        codes.push(m);
+        return "\u0001" + (codes.length - 1) + "\u0001";
+      });
+      if (s.charAt(0) === "|") s = s.slice(1);
+      if (s.charAt(s.length - 1) === "|") s = s.slice(0, -1);
+      var cells = s.split("|");
+      for (var k = 0; k < cells.length; k++) {
+        var c = cells[k].replace(/\u0001(\d+)\u0001/g, function (m, n) { return codes[+n]; });
+        cells[k] = c.replace(/^[ \t]+|[ \t]+$/g, "");
+      }
+      return cells;
+    }
+    function colAlign(cell) {
+      var s = cell.replace(/[ \t]/g, "");
+      if (!/^:?-{3,}:?$/.test(s)) return "";
+      var L = s.charAt(0) === ":";
+      var R = s.charAt(s.length - 1) === ":";
+      if (L && R) return "center";
+      if (R) return "right";
+      return "left";
+    }
+    function sepRow(line) {
+      var cells = splitRow(line);
+      if (!cells || !cells.length) return null;
+      var aligns = [];
+      for (var k = 0; k < cells.length; k++) {
+        var a = colAlign(cells[k]);
+        if (!a) return null;
+        aligns.push(a);
+      }
+      return aligns;
+    }
+    function cellHtml(tag, text, align) {
+      var cls = align === "center" ? " class=\"c\"" : align === "right" ? " class=\"r\"" : "";
+      return "<" + tag + cls + ">" + inlineMd(text) + "</" + tag + ">";
+    }
+    function tableHtml(head, aligns, rows) {
+      var h = "<div class=\"md-table\"><table><thead><tr>";
+      var c;
+      for (c = 0; c < head.length; c++) h += cellHtml("th", head[c], aligns[c] || "left");
+      h += "</tr></thead>";
+      if (rows.length) {
+        h += "<tbody>";
+        for (var r = 0; r < rows.length; r++) {
+          h += "<tr>";
+          var n = head.length > rows[r].length ? head.length : rows[r].length;
+          for (c = 0; c < n; c++) {
+            h += cellHtml("td", rows[r][c] || "", c < aligns.length ? aligns[c] : "left");
+          }
+          h += "</tr>";
+        }
+        h += "</tbody>";
+      }
+      return h + "</table></div>";
+    }
     while (i < lines.length) {
       var line = lines[i];
       if (blank(line)) { flushPara(); i++; continue; }
+      var fen = fenceOpen(line);
+      if (fen) {
+        flushPara();
+        i++;
+        var body = [];
+        while (i < lines.length && !fenceClose(lines[i], fen.n)) {
+          body.push(lines[i]);
+          i++;
+        }
+        if (i < lines.length) i++;
+        html += fenceHtml(body.join("\n"), fen.lang);
+        continue;
+      }
+      if (i + 1 < lines.length) {
+        var aligns = sepRow(lines[i + 1]);
+        var headCells = aligns ? splitRow(line) : null;
+        if (headCells && aligns && headCells.length === aligns.length && !sepRow(line)) {
+          flushPara();
+          i += 2;
+          var rows = [];
+          var row;
+          while (i < lines.length && !blank(lines[i]) && (row = splitRow(lines[i]))) {
+            rows.push(row);
+            i++;
+          }
+          html += tableHtml(headCells, aligns, rows);
+          continue;
+        }
+      }
       var hm = /^(#{1,6}) (.+)$/.exec(line);
       if (hm) {
         flushPara();

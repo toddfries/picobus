@@ -37,7 +37,24 @@ var cases = [
   ["- **a**", "<ul><li><strong>a</strong></li></ul>"],
   ["</p><img src=x>", "<p>&lt;/p&gt;&lt;img src=x&gt;</p>"],
   ["a\n   \nb", "<p>a</p><p>b</p>"],
-  ["say `a` please", "<p>say <code>a</code> please</p>"]
+  ["say `a` please", "<p>say <code>a</code> please</p>"],
+  ["```\n<b>\n```", "<pre><code>&lt;b&gt;</code></pre>"],
+  ["```\n**x**\n```", "<pre><code>**x**</code></pre>"],
+  ["```js\nvar a = 1;\n```", "<pre><code class=\"language-js\">var a = 1;</code></pre>"],
+  ["```\n  indent\n```", "<pre><code>  indent</code></pre>"],
+  ["```\nline1\n\nline2\n```", "<pre><code>line1\n\nline2</code></pre>"],
+  ["```\nno close", "<pre><code>no close</code></pre>"],
+  ["say\n```\ncode\n```\nmore", "<p>say</p><pre><code>code</code></pre><p>more</p>"],
+  ["```\"><b>\nx\n```", "<pre><code>x</code></pre>"],
+  ["```\r\na\r\n```", "<pre><code>a</code></pre>"],
+  ["| a | b |\n| --- | --- |\n| 1 | 2 |", "<div class=\"md-table\"><table><thead><tr><th>a</th><th>b</th></tr></thead><tbody><tr><td>1</td><td>2</td></tr></tbody></table></div>"],
+  ["a | b\n--- | ---\n**1** | 2", "<div class=\"md-table\"><table><thead><tr><th>a</th><th>b</th></tr></thead><tbody><tr><td><strong>1</strong></td><td>2</td></tr></tbody></table></div>"],
+  ["| a | b |\n| ---: | :---: |\n| 1 | 2 |", "<div class=\"md-table\"><table><thead><tr><th class=\"r\">a</th><th class=\"c\">b</th></tr></thead><tbody><tr><td class=\"r\">1</td><td class=\"c\">2</td></tr></tbody></table></div>"],
+  ["| <b> |\n| --- |\n| x |", "<div class=\"md-table\"><table><thead><tr><th>&lt;b&gt;</th></tr></thead><tbody><tr><td>x</td></tr></tbody></table></div>"],
+  ["| `a|b` | c |\n| --- | --- |\n| 1 | 2 |", "<div class=\"md-table\"><table><thead><tr><th><code>a|b</code></th><th>c</th></tr></thead><tbody><tr><td>1</td><td>2</td></tr></tbody></table></div>"],
+  ["not | a table", "<p>not | a table</p>"],
+  ["| a |\n| --- |\n| 1 |\n\nafter", "<div class=\"md-table\"><table><thead><tr><th>a</th></tr></thead><tbody><tr><td>1</td></tr></tbody></table></div><p>after</p>"],
+  ["<table><tr><td>a</td></tr></table>", "<p>&lt;table&gt;&lt;tr&gt;&lt;td&gt;a&lt;/td&gt;&lt;/tr&gt;&lt;/table&gt;</p>"]
 ];
 var fail = 0;
 for (var i = 0; i < cases.length; i++) {

@@ -39,6 +39,13 @@ my $FCGI_SOCK  = $ENV{FCGI_SOCK} // '/var/www/run/picoclaw/fcgi.sock';
 my $MAX_LOG    = 50000;        # server history; the browser only gets one page
 my $MAX_UPLOAD = 8 * 1024 * 1024;
 my $SELECT_TO  = 0.5;          # seconds; keeps CPU near zero
+# A thinking flag older than this is idle. The UI polls faster; this is the
+# freeze backup when a gateway stops refreshing the bus.
+my $ACTIVITY_STALE = 10;
+if (defined $ENV{PICOBUS_ACTIVITY_STALE} && $ENV{PICOBUS_ACTIVITY_STALE} =~ /^[0-9]+$/) {
+    $ACTIVITY_STALE = int($ENV{PICOBUS_ACTIVITY_STALE});
+    $ACTIVITY_STALE = 1 if $ACTIVITY_STALE < 1;
+}
 my $UMASK      = 0117;         # socket perms 0660-ish after umask
 my $STATE_DIR  = $ENV{PICOBUS_STATE} // '/var/picobus';
 my $HUB_LOG    = $ENV{HUB_LOG}  // "$STATE_DIR/hub-events.ndjson";
@@ -311,14 +318,8 @@ sub handle_agent_line {
     return unless $obj && ref $obj eq 'HASH' && $obj->{type};
 
     if ($obj->{type} eq 'register') {
-        # already registered under this id? replace
-        if (exists $agents{$id} && $agents{$id}{sock} ne $agents{$obj->{id}}{sock}) {
-            # ignore
-        }
         $obj->{id} //= $id;
-        log_msg({ type => 'register', id => $obj->{id} });
-        ensure_dm_channel($obj->{id});
-        refresh_team_group();
+        bind_registered_agent($agents{$id}{sock}, $id, $obj->{id}, $agents{$id}{buf} // '');
         return;
     }
     if ($obj->{type} eq 'channel') {
@@ -334,17 +335,88 @@ sub handle_agent_line {
         }
         return;
     }
+    # Presence only. The connection id wins; a JSON from cannot spoof another berth.
+    # Not fanned out and not written to the chat log.
+    if (($obj->{type} // '') eq 'activity') {
+        note_activity($id, $obj->{activity} // '');
+        return;
+    }
     $obj->{from} //= $id;
     route_message($obj);
+}
+
+sub note_activity {
+    my ($id, $state) = @_;
+    return unless defined $id && exists $agents{$id};
+    return unless $state eq 'thinking' || $state eq 'idle';
+    $agents{$id}{activity}    = $state;
+    $agents{$id}{activity_at} = time();
+}
+
+sub activity_now {
+    my ($id) = @_;
+    my $a = $agents{$id} or return 'idle';
+    return 'idle' unless ($a->{activity} // '') eq 'thinking';
+    my $at = $a->{activity_at} // 0;
+    return 'idle' if time() - $at >= $ACTIVITY_STALE;
+    return 'thinking';
+}
+
+sub expire_stale_activity {
+    my $now = time();
+    for my $id (keys %agents) {
+        my $a = $agents{$id} or next;
+        next unless ($a->{activity} // '') eq 'thinking';
+        my $at = $a->{activity_at} // 0;
+        if ($now - $at >= $ACTIVITY_STALE) {
+            $a->{activity} = 'idle';
+        }
+    }
+}
+
+# Take the berth name for this socket. A second socket for an id that is
+# already up replaces it quietly: no extra online line, and the retired
+# socket's later close is not an offline.
+sub bind_registered_agent {
+    my ($fh, $old_id, $new, $buf) = @_;
+    return unless $fh && defined $new && $new ne '' && $new !~ /^(?:anon|gone)-/;
+    my $fn = fileno($fh);
+    return unless defined $fn;
+    if (defined $old_id && $old_id ne $new && $old_id =~ /^anon-/) {
+        delete $agents{$old_id};
+    }
+    my $already = 0;
+    if (my $prev = $agents{$new}) {
+        my $ps = $prev->{sock};
+        if ($ps && defined fileno($ps)) {
+            $already = 1;
+            my $oldfn = fileno($ps);
+            $fd2id{$oldfn} = "gone-$oldfn" if defined $oldfn && $oldfn != $fn;
+        }
+    }
+    my $activity = $already ? $agents{$new}{activity} : undef;
+    my $activity_at = $already ? $agents{$new}{activity_at} : undef;
+    $agents{$new} = { sock => $fh, buf => (defined $buf ? $buf : '') };
+    $agents{$new}{activity} = $activity if defined $activity;
+    $agents{$new}{activity_at} = $activity_at if defined $activity_at;
+    $fd2id{$fn} = $new;
+    ensure_dm_channel($new);
+    refresh_team_group();
+    log_msg({ type => 'register', id => $new }) unless $already;
 }
 
 sub close_agent {
     my ($fh) = @_;
     my $fn = fileno($fh);
     my $id = delete $fd2id{$fn};
-    if ($id) {
+    if (defined $id && $id =~ /^anon-/) {
         delete $agents{$id};
-        log_msg({ type => 'disconnect', id => $id });
+    } elsif (defined $id && $id !~ /^gone-/) {
+        my $cur = $agents{$id};
+        if ($cur && $cur->{sock} && defined fileno($cur->{sock}) && fileno($cur->{sock}) == $fn) {
+            delete $agents{$id};
+            log_msg({ type => 'disconnect', id => $id });
+        }
     }
     $sel->remove($fh);
     close $fh;
@@ -736,17 +808,16 @@ sub in_channel {
     my $who = $m->{from} // '';
     my $to  = $m->{to}   // '';
     $to =~ s/^@//;
-    my $rid = $m->{id}   // '';
     if ($chan eq 'all') {
         return 1 if $t eq 'register' || $t eq 'disconnect' || $t eq 'error' || $t eq 'ack';
         return is_broadcast_to($to);
     }
+    # Presence is a #system note, not a line in the berth transcript.
+    return 0 if $t eq 'register' || $t eq 'disconnect';
     if (($channels{$chan}{kind} // '') eq 'group') {
         return 1 if $to eq $chan;
         return 0;
     }
-    # DM / agent channel
-    return 1 if ($t eq 'register' || $t eq 'disconnect') && ($rid eq $chan || $who eq $chan);
     return 0 if ($channels{$to}{kind} // '') eq 'group';
     return 1 if $to eq $chan;
     return 1 if $who eq $chan && !is_broadcast_to($to);
@@ -767,12 +838,37 @@ sub msg_lines {
     return $n < 1 ? 1 : $n;
 }
 
+# #system shows one online and one offline per real transition. A berth that
+# re-registers while it is still up, and the old copies of that in the log,
+# do not each get a line.
+sub history_rows {
+    my ($chan) = @_;
+    $chan ||= 'all';
+    my @rows = grep { in_channel($_, $chan) } @log;
+    return @rows if $chan ne 'all';
+    my %up;
+    my @kept;
+    for my $m (@rows) {
+        my $t  = $m->{type} // '';
+        my $id = $m->{id} // $m->{from} // '';
+        if ($t eq 'register') {
+            next if $id eq '' || $up{$id};
+            $up{$id} = 1;
+        } elsif ($t eq 'disconnect') {
+            next if $id eq '' || !$up{$id};
+            $up{$id} = 0;
+        }
+        push @kept, $m;
+    }
+    return @kept;
+}
+
 sub history_page {
     my ($chan, $page, $lines_per) = @_;
     $chan ||= 'all';
     $lines_per = 32 if !$lines_per || $lines_per < 8;
     $lines_per = 80 if $lines_per > 80;
-    my @ch = grep { in_channel($_, $chan) } @log;
+    my @ch = history_rows($chan);
     my @lens = map { msg_lines($_) } @ch;
 
     # Pack whole messages (oldest = page 1). A message that does not fit the
@@ -859,6 +955,7 @@ sub agent_record {
         id        => $id,
         name      => $id,
         connected => $live ? \1 : \0,
+        activity  => ($live ? activity_now($id) : 'idle'),
     };
 }
 
@@ -1708,6 +1805,19 @@ body {
 .dot.on,.dot.green { background:var(--green); }
 .dot.yellow { background:var(--yellow); }
 .dot.red { background:var(--red); }
+.dot.thinking {
+  background: repeating-linear-gradient(
+    115deg,
+    var(--green) 0 2px,
+    var(--blurple) 2px 4px
+  );
+  animation: dot-spin 0.9s linear infinite;
+}
+.dot.thinking.hold { animation-play-state: paused; }
+@keyframes dot-spin { to { transform: rotate(360deg); } }
+@media (prefers-reduced-motion: reduce) {
+  .dot.thinking { animation: none; }
+}
 .side-foot {
   padding:10px 16px; font-size:12px; color:var(--muted);
   border-top:1px solid #1f2023;
@@ -1874,6 +1984,10 @@ html[data-zhc-theme="light"] #channels::-webkit-scrollbar-thumb { background:#c4
   var pinned = false;
   var lastAgentsRaw = "";
   var lastData = { agents: [], scores: {}, seq: 0 };
+  var stateGen = 0;
+  var seenFrom = {};
+  var holdFor = {};
+  var primed = {};
   var paneMap = {};
   var pendingFiles = [];
   var pane, panesRoot, channels, head, toField, content, composer, sideFoot, pager, pendingEl, fileInput;
@@ -2070,14 +2184,19 @@ html[data-zhc-theme="light"] #channels::-webkit-scrollbar-thumb { background:#c4
     return m ? m[1] : s;
   }
   function dotClass(a) {
+    var cls;
     var b = a.band || "";
-    if (b === "Green") return "dot green";
-    if (b === "Yellow") return "dot yellow";
-    if (b === "Red") return "dot red";
-    return a.connected ? "dot on" : "dot off";
+    if (a.connected && a.activity === "thinking") cls = "dot on thinking";
+    else if (b === "Green") cls = "dot green";
+    else if (b === "Yellow") cls = "dot yellow";
+    else if (b === "Red") cls = "dot red";
+    else cls = a.connected ? "dot on" : "dot off";
+    if (cls.indexOf("thinking") >= 0 && holdFor[a.id] === stateGen) cls += " hold";
+    return cls;
   }
   function scoreTitle(a) {
     var bits = [a.connected ? "online" : "offline"];
+    if (a.activity === "thinking") bits.push("thinking");
     if (a.band) bits.push(a.band);
     if (a.E != null) bits.push("E " + Number(a.E).toFixed(2));
     if (a.I != null) bits.push("I " + Number(a.I).toFixed(2));
@@ -2097,7 +2216,7 @@ html[data-zhc-theme="light"] #channels::-webkit-scrollbar-thumb { background:#c4
       if (t === "register" || t === "disconnect" || t === "error" || t === "ack") return true;
       return isBroadcastTo(to);
     }
-    if (t === "register" || t === "disconnect") return rid === chan || who === chan;
+    if (t === "register" || t === "disconnect") return false;
     if (who === chan && !isBroadcastTo(to)) return true;
     if (to === chan || to === "@" + chan) return true;
     return false;
@@ -2210,11 +2329,11 @@ html[data-zhc-theme="light"] #channels::-webkit-scrollbar-thumb { background:#c4
   function messageHtml(m) {
     var t = m.type || "";
     if (t === "register") {
-      return '<div class="msg sys">' + esc(m.id || m.from) + " connected"
+      return '<div class="msg sys">' + esc(m.id || m.from) + " online"
         + '<span class="ts">' + esc(fmtTs(m.ts)) + "</span></div>";
     }
     if (t === "disconnect") {
-      return '<div class="msg sys">' + esc(m.id || m.from) + " disconnected"
+      return '<div class="msg sys">' + esc(m.id || m.from) + " offline"
         + '<span class="ts">' + esc(fmtTs(m.ts)) + "</span></div>";
     }
     if (t === "error" || t === "ack") {
@@ -2339,15 +2458,58 @@ html[data-zhc-theme="light"] #channels::-webkit-scrollbar-thumb { background:#c4
       for (var i = 0; i < msgs.length; i++) html += messageHtml(msgs[i]);
       if (!html) html = emptyHtml(chan);
       st.el.innerHTML = html;
+      notePainted(chan, msgs);
       if (st.follow) st.el.scrollTop = st.el.scrollHeight;
       if (chan === selected) renderPager();
     }).catch(function () {});
   }
+  function activityOf(id) {
+    var agents = lastData.agents || [];
+    for (var i = 0; i < agents.length; i++) {
+      if (agents[i].id === id) return agents[i].activity || "idle";
+    }
+    return "idle";
+  }
+  function notePainted(chan, msgs) {
+    var first = !primed[chan];
+    primed[chan] = true;
+    var latest = {};
+    var order = [];
+    for (var i = 0; i < msgs.length; i++) {
+      var m = msgs[i];
+      var t = m.type || "";
+      if (t === "register" || t === "disconnect" || t === "error" || t === "ack") continue;
+      var who = m.from || "";
+      if (!who || who === "human") continue;
+      var key = String(m.ts || "") + "\n" + String(m.content || "");
+      if (!latest[who]) order.push(who);
+      latest[who] = key;
+    }
+    var hold = false;
+    for (var j = 0; j < order.length; j++) {
+      var id = order[j];
+      var key = latest[id];
+      var prev = seenFrom[id];
+      seenFrom[id] = key;
+      if (first || prev === key) continue;
+      if (activityOf(id) === "thinking") {
+        holdFor[id] = stateGen;
+        hold = true;
+      }
+    }
+    if (hold) renderChannels(lastData.agents || []);
+  }
   function applyAgents(data) {
+    var prevGen = stateGen;
+    stateGen++;
+    var hadHold = false;
+    for (var hid in holdFor) {
+      if (holdFor[hid] === prevGen) hadHold = true;
+    }
     var raw = JSON.stringify(data.agents || []);
     var seq = data.seq || 0;
     lastData = data;
-    if (raw !== lastAgentsRaw) {
+    if (raw !== lastAgentsRaw || hadHold) {
       lastAgentsRaw = raw;
       var agents = data.agents || [];
       for (var i = 0; i < agents.length; i++) ensurePane(agents[i].id);
@@ -2690,6 +2852,7 @@ hub_sandbox();
 print STDERR "picobus listening agents=$HUB_SOCK fcgi=", ($DO_FCGI ? ($FCGI_SOCK // 'stdin') : 'off'), "\n";
 
 while (1) {
+    expire_stale_activity();
     # STDIN-style FCGI (slowcgi): poll. Own listen socket: handled in select.
     if ($DO_FCGI && $request && !$fcgi_listen_fh && $request->Accept() >= 0) {
         handle_fcgi($request);
@@ -2740,14 +2903,9 @@ while (1) {
             if ($line =~ /"type"\s*:\s*"register"/) {
                 my $obj = eval { decode_json($line) };
                 if ($obj && $obj->{id}) {
-                    my $new = $obj->{id};
-                    delete $agents{$id};
-                    $agents{$new} = { sock => $fh, buf => $$bufref };
-                    $fd2id{$fn} = $new;
-                    $id = $new;
-                    log_msg({ type => 'register', id => $new });
-                    ensure_dm_channel($new);
-                    refresh_team_group();
+                    bind_registered_agent($fh, $id, $obj->{id}, $$bufref);
+                    $id = $obj->{id};
+                    $bufref = \$agents{$id}{buf} if $agents{$id};
                     next;
                 }
             }

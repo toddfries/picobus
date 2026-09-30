@@ -146,6 +146,35 @@ if ($up) {
     print $tx "{]\n";
     select undef, undef, undef, 0.3;
     ok(kill(0, $pid), 'malformed line does not kill hub');
+
+    my $act_rx = connect_hub();
+    print $act_rx encode_json({ type => 'register', id => 'proto-act' }), "\n";
+    select undef, undef, undef, 0.2;
+    print $tx encode_json({
+        type => 'activity', activity => 'thinking', from => 'proto-rx',
+    }), "\n";
+    my $got_act = 0;
+    eval {
+        local $SIG{ALRM} = sub { die "timeout" };
+        alarm 1;
+        while (my $line = <$act_rx>) {
+            if ($line =~ /activity|thinking/) { $got_act = 1; last }
+        }
+        alarm 0;
+    };
+    alarm 0;
+    ok(!$got_act, 'activity is not delivered to other agents');
+    close $act_rx;
+    select undef, undef, undef, 0.2;
+    my $logged = 0;
+    if (open my $lf, '<', $log) {
+        local $/;
+        my $all = <$lf> // '';
+        close $lf;
+        $logged = 1 if $all =~ /activity/;
+    }
+    ok(!$logged, 'activity is absent from the hub log');
+
     close $tx;
     close $rx;
 } else {
@@ -156,6 +185,8 @@ if ($up) {
     ok(0, 'group isolation (skipped)');
     ok(0, 'unknown to= (skipped)');
     ok(0, 'malformed line (skipped)');
+    ok(0, 'activity is not delivered (skipped)');
+    ok(0, 'activity is absent from the hub log (skipped)');
 }
 
 if ($pid) {

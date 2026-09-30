@@ -363,6 +363,14 @@ sub handle_pico {
     return unless $msg && ref $msg eq 'HASH';
     my $type = $msg->{type} // '';
     my $sid  = $msg->{session_id} // '';
+    if ($type eq 'activity') {
+        my $pl = $msg->{payload};
+        $pl = {} unless $pl && ref $pl eq 'HASH';
+        my $st = $pl->{state} // '';
+        return unless $st eq 'thinking' || $st eq 'idle';
+        hub_write($agent, { type => 'activity', activity => $st });
+        return;
+    }
     if ($type eq 'bus.send') {
         my $pl      = $msg->{payload} || {};
         my $to      = $pl->{to} // '';

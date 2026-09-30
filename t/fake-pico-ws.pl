@@ -105,6 +105,14 @@ Mojo::IOLoop->recurring(0.1 => sub {
     my $c = $conns{$sid} or return;
     my $e = $emit;
     undef $emit;
+    if (defined $e->{activity}) {
+        $c->send({ json => {
+            type       => 'activity',
+            session_id => $sid,
+            payload    => { state => $e->{activity} },
+        }});
+        return;
+    }
     $c->send({ json => {
         type       => 'bus.send',
         id         => 't1',

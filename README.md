@@ -52,6 +52,12 @@ must match the `session_id` on `message.send` or Pico replies
 Hub socket mode is 0660. Set `HUB_GROUP` so every client user is in
 that group; do not chmod the socket 0666.
 
+talkd (IRC/XMPP/… ) is a hub client: register as `talkd` (never a
+gateway id), unicast `to=<agent>`, apply protocol ACLs **in talkd**.
+It never speaks Pico and never uses inbox files. `to=all` is the
+system log, not work. Gateway liveness is `GET /health` on the
+gateway port, token-free, not a hub message.
+
 `picobus` writes every bus message to `hub-events.ndjson`. It does not
 score agents and it does not own a roster. A product that wants either
 of those reads the event log, or starts the agents that register.

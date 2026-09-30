@@ -717,15 +717,11 @@ sub history_page {
     $lines_per = 80 if $lines_per > 80;
     my @ch = grep { in_channel($_, $chan) } @log;
     my @lens = map { msg_lines($_) } @ch;
-    my $total_lines = 0;
-    $total_lines += $_ for @lens;
-    my $pages = 1;
-    if ($total_lines > $lines_per) {
-        $pages = int(($total_lines + $lines_per - 1) / $lines_per);
-    }
-    $page = $pages if !defined $page || $page < 1 || $page > $pages;
 
-    # Pack messages onto pages by line budget (oldest = page 1).
+    # Pack whole messages (oldest = page 1). A message that does not fit the
+    # room left on a page starts the next one, so leftover lines are wasted.
+    # ceil(total_lines / budget) ignores that waste and is short by a page;
+    # "last" and a click on the highest number then stay on the previous page.
     my @page_idx;
     my ($pno, $used) = (1, 0);
     for my $i (0 .. $#ch) {
@@ -737,8 +733,9 @@ sub history_page {
         push @{ $page_idx[$pno] }, $i;
         $used += $need;
     }
-    $pages = $pno if $pno > $pages;
-    $page = $pages if $page > $pages;
+    my $pages = $pno;
+    # page < 1 means last (the API passes -1 for an omitted page and "last").
+    $page = $pages if !defined $page || $page < 1 || $page > $pages;
     my @slice = map { $ch[$_] } @{ $page_idx[$page] || [] };
     return {
         channel => $chan,
@@ -1987,7 +1984,9 @@ textarea:disabled { opacity:.55; }
     if (next > pages) next = pages;
     st.follow = (next >= pages);
     st.page = next;
-    loadHistory(selected);
+    // A numbered click requests that page. Only the last-page control and
+    // the follow poll ask for "last".
+    loadHistory(selected, spec !== "last");
   }
   var pollTimer = 0;
   function bootOut(code) {
@@ -2005,10 +2004,10 @@ textarea:disabled { opacity:.55; }
     if (r && (r.status === 401 || r.status === 403)) { bootOut(r.status); return true; }
     return false;
   }
-  function loadHistory(chan) {
+  function loadHistory(chan, exact) {
     chan = chan || selected;
     var st = ensurePane(chan);
-    var page = st.follow ? "last" : String(st.page || "last");
+    var page = (!exact && st.follow) ? "last" : String(st.page || "last");
     var url = "__API__/history?channel=" + encodeURIComponent(chan)
       + "&page=" + encodeURIComponent(page) + "&lines=" + linesPer();
     var isLast = st.follow || page === "last";

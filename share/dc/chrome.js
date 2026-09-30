@@ -505,6 +505,17 @@
     refreshThemeBar();
   }
 
+  function fitChrome() {
+    var app = document.querySelector('.app');
+    if (!app) return;
+    var bar = document.getElementById('zhc-theme-bar');
+    var tray = document.getElementById('zhc-cookie-tray');
+    var top = bar ? Math.ceil(bar.getBoundingClientRect().height) + 6 : 52;
+    var bottom = tray ? Math.ceil(tray.getBoundingClientRect().height) + 8 : 56;
+    app.style.paddingTop = top + 'px';
+    app.style.paddingBottom = bottom + 'px';
+  }
+
   function mount() {
     applyTheme();
     mountThemeControl();
@@ -519,6 +530,8 @@
       }));
     }
     refreshTray();
+    fitChrome();
+    window.addEventListener('resize', fitChrome);
     try {
       if (window.matchMedia) {
         matchMedia('(prefers-color-scheme: dark)').addEventListener('change', function () {

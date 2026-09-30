@@ -843,44 +843,126 @@ sub zhc_ct_eq {
     return $d == 0;
 }
 
-sub zhc_cookie_sid {
-    return '' if !defined $ZHC_COOKIE || $ZHC_COOKIE !~ /^[A-Za-z0-9_]{1,64}\z/;
+# Every ZHCSESS_PROD value, plus a flag when one of them is malformed.
+# Last-match would treat a leftover allowlisted cookie as the sign-in.
+sub zhc_cookie_sids {
+    return ([], 1) if !defined $ZHC_COOKIE || $ZHC_COOKIE !~ /^[A-Za-z0-9_]{1,64}\z/;
     my $raw = $ENV{HTTP_COOKIE} // '';
-    my $sid = '';
+    my @sids;
+    my $bad = 0;
     for my $part (split /;\s*/, $raw) {
         my ($k, $v) = split /=/, $part, 2;
         next unless defined $k && defined $v;
-        $k =~ s/^\s+//;
-        $sid = $v if $k eq $ZHC_COOKIE;
+        $k =~ s/^\s+|\s+$//g;
+        $v =~ s/^\s+|\s+$//g;
+        next unless $k eq $ZHC_COOKIE;
+        if ($v =~ /\A[A-Za-z0-9,-]{16,128}\z/) {
+            push @sids, $v unless grep { $_ eq $v } @sids;
+        } else {
+            $bad = 1;
+        }
     }
-    $sid =~ s/\s+\z//;
-    return '' unless $sid =~ /\A[A-Za-z0-9,-]{16,128}\z/;
-    return $sid;
+    return (\@sids, $bad);
 }
 
-# PHP session file. Integer id only. Missing or unreadable is "not signed in".
-sub zhc_session_uid {
-    return 0 if $ZHC_SESS_DIR !~ m{\A/} || $ZHC_SESS_DIR =~ m{\.\.};
-    my $sid = zhc_cookie_sid();
-    return 0 if $sid eq '';
+# One PHP serialize value. Returns (node, rest) or an empty list.
+sub zhc_php_take {
+    my ($rest) = @_;
+    return if !defined $rest || $rest eq '';
+    if ($rest =~ /\Ai:(-?\d+);/s) {
+        return ({ t => 'i', i => $1 + 0 }, substr($rest, length($&)));
+    }
+    if ($rest =~ /\A(?:b:[01];|N;|d:[^;]*;)/s) {
+        return ({ t => 'x' }, substr($rest, length($&)));
+    }
+    if ($rest =~ /\As:(\d+):"/s) {
+        my $len = $1 + 0;
+        my $hdr = length($&);
+        return if $hdr + $len + 2 > length($rest);
+        my $val = substr($rest, $hdr, $len);
+        my $after = substr($rest, $hdr + $len);
+        return unless $after =~ /\A";/s;
+        return ({ t => 's', s => $val }, substr($after, 2));
+    }
+    if ($rest =~ /\Aa:(\d+):\{/s) {
+        my $n = $1 + 0;
+        return if $n > 10000;
+        my $cur = substr($rest, length($&));
+        for (1 .. $n) {
+            my ($k, $r1) = zhc_php_take($cur);
+            return unless $k;
+            my ($v, $r2) = zhc_php_take($r1);
+            return unless $v;
+            $cur = $r2;
+        }
+        return unless $cur =~ /\A\}/s;
+        return ({ t => 'x' }, substr($cur, 1));
+    }
+    if ($rest =~ /\AO:(\d+):"/s) {
+        my $nlen = $1 + 0;
+        my $hdr = length($&);
+        return if $hdr + $nlen + 2 > length($rest);
+        my $after = substr($rest, $hdr + $nlen);
+        return unless $after =~ /\A":(\d+):\{/s;
+        my $n = $1 + 0;
+        return if $n > 10000;
+        my $cur = substr($after, length($&));
+        for (1 .. $n) {
+            my ($k, $r1) = zhc_php_take($cur);
+            return unless $k;
+            my ($v, $r2) = zhc_php_take($r1);
+            return unless $v;
+            $cur = $r2;
+        }
+        return unless $cur =~ /\A\}/s;
+        return ({ t => 'x' }, substr($cur, 1));
+    }
+    return;
+}
+
+# PHP session file. () on any failure. user_id is a product profile, not the account.
+sub zhc_session_claims {
+    my ($sid) = @_;
+    return if !defined $sid || $sid !~ /\A[A-Za-z0-9,-]{16,128}\z/;
+    return if $ZHC_SESS_DIR !~ m{\A/} || $ZHC_SESS_DIR =~ m{\.\.};
     my $path = $ZHC_SESS_DIR . '/sess_' . $sid;
     my @st = lstat($path);
-    return 0 unless @st;
-    return 0 if -l _;
-    return 0 unless -f _;
-    return 0 if ($st[7] // 0) <= 0 || $st[7] > 65536;
-    open my $fh, '<', $path or return 0;
+    return unless @st;
+    return if -l _;
+    return unless -f _;
+    return if ($st[7] // 0) <= 0 || $st[7] > 65536;
+    open my $fh, '<', $path or return;
     my $data = '';
     my $n = read($fh, $data, 65536);
     close $fh;
-    return 0 unless $n;
-    my $id;
-    if ($data =~ /zhc_user_id\|i:(\d+);/) {
-        $id = $1 + 0;
-    } elsif ($data =~ /zhc_user_id\|s:\d+:"(\d+)";/) {
-        $id = $1 + 0;
+    return unless $n;
+    my %kv;
+    my $rest = $data;
+    my $guard = 0;
+    while (length($rest) && $guard++ < 64) {
+        return unless $rest =~ /\A([A-Za-z_][A-Za-z0-9_]*)\|/s;
+        my $key = $1;
+        my ($val, $next) = zhc_php_take(substr($rest, length($key) + 1));
+        return unless $val;
+        $kv{$key} = $val;
+        $rest = $next;
     }
-    return ($id && $id > 0) ? $id : 0;
+    return if length $rest;
+    my $idv = $kv{zhc_user_id};
+    return unless $idv;
+    my $uid;
+    if ($idv->{t} eq 'i') {
+        $uid = $idv->{i};
+    } elsif ($idv->{t} eq 's' && ($idv->{s} // '') =~ /\A\d+\z/) {
+        $uid = $idv->{s} + 0;
+    }
+    return unless $uid && $uid > 0;
+    my $sess_email;
+    if (exists $kv{email}) {
+        return unless $kv{email}{t} eq 's';
+        $sess_email = $kv{email}{s};
+    }
+    return ($uid, $sess_email);
 }
 
 # ('ok', row) | ('miss') | ('err'). Read-only. Never interpolates the id into SQL.
@@ -915,8 +997,9 @@ sub zhc_user_row {
     return $row ? ('ok', $row) : ('miss');
 }
 
-sub zhc_authorize {
-    my $uid = zhc_session_uid();
+sub zhc_authorize_sid {
+    my ($sid) = @_;
+    my ($uid, $sess_email) = zhc_session_claims($sid);
     return { ok => 0, code => 401, error => 'sign in required' } unless $uid;
     my $allow = lc $ZHC_EMAIL;
     $allow =~ s/^\s+|\s+$//g;
@@ -932,7 +1015,25 @@ sub zhc_authorize {
     $email =~ s/^\s+|\s+$//g;
     return { ok => 0, code => 403, error => 'forbidden' }
         unless zhc_ct_eq(sha256_hex($email), sha256_hex($allow));
+    # A copied email that is not the allowlisted account is a second sign-in.
+    if (defined $sess_email) {
+        my $se = lc $sess_email;
+        $se =~ s/^\s+|\s+$//g;
+        return { ok => 0, code => 403, error => 'forbidden' }
+            unless zhc_ct_eq(sha256_hex($se), sha256_hex($allow));
+    }
     return { ok => 1, code => 200 };
+}
+
+sub zhc_authorize {
+    my ($sids, $bad) = zhc_cookie_sids();
+    return { ok => 0, code => 401, error => 'sign in required' } if $bad || !@$sids;
+    my $decision;
+    for my $sid (@$sids) {
+        $decision = zhc_authorize_sid($sid);
+        return $decision if !$decision->{ok};
+    }
+    return $decision;
 }
 
 # Page at /dc. API at /api/v1/dc/{state,history,send,files}. Nothing else.
@@ -1886,6 +1987,22 @@ textarea:disabled { opacity:.55; }
     st.page = next;
     loadHistory(selected);
   }
+  var pollTimer = 0;
+  function bootOut(code) {
+    if (pollTimer) { clearInterval(pollTimer); pollTimer = 0; }
+    var title = code === 401 ? "Sign in required" : "Forbidden";
+    var extra = code === 401
+      ? "<p>Sign in required.</p><p><a href=\"/account/\">Sign in</a></p>"
+      : "<p>Forbidden.</p>";
+    document.open();
+    document.write("<!DOCTYPE html><html lang=\"en\"><head><meta charset=\"utf-8\"><title>"
+      + title + "</title></head><body>" + extra + "</body></html>");
+    document.close();
+  }
+  function denied(r) {
+    if (r && (r.status === 401 || r.status === 403)) { bootOut(r.status); return true; }
+    return false;
+  }
   function loadHistory(chan) {
     chan = chan || selected;
     var st = ensurePane(chan);
@@ -1894,6 +2011,7 @@ textarea:disabled { opacity:.55; }
       + "&page=" + encodeURIComponent(page) + "&lines=" + linesPer();
     var isLast = st.follow || page === "last";
     fetch(url, { cache: isLast ? "no-store" : "default" }).then(function (r) {
+      if (denied(r)) return null;
       if (r.status === 304) return null;
       return r.json();
     }).then(function (h) {
@@ -1936,7 +2054,10 @@ textarea:disabled { opacity:.55; }
     }
   }
   function tick() {
-    fetch("__API__/state", { cache: "no-store" }).then(function (r) { return r.json(); }).then(applyAgents).catch(function () {});
+    fetch("__API__/state", { cache: "no-store" }).then(function (r) {
+      if (denied(r)) return null;
+      return r.json();
+    }).then(function (data) { if (data) applyAgents(data); }).catch(function () {});
   }
   function refreshPending() {
     if (!pendingEl) return;
@@ -1948,7 +2069,10 @@ textarea:disabled { opacity:.55; }
   function uploadFile(file) {
     var q = "__API__/files?name=" + encodeURIComponent(file.name)
       + "&mime=" + encodeURIComponent(file.type || "application/octet-stream");
-    return fetch(q, { method: "POST", body: file }).then(function (r) { return r.json(); }).then(function (j) {
+    return fetch(q, { method: "POST", body: file }).then(function (r) {
+      if (denied(r)) return null;
+      return r.json();
+    }).then(function (j) {
       if (j && j.ok && j.id) pendingFiles.push(j);
       refreshPending();
     });
@@ -1967,7 +2091,7 @@ textarea:disabled { opacity:.55; }
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ to: to, content: text, files: files })
     }).then(function (r) {
-      if (!r.ok) return;
+      if (denied(r) || !r.ok) return;
       content.value = "";
       pendingFiles = [];
       refreshPending();
@@ -2063,7 +2187,7 @@ textarea:disabled { opacity:.55; }
     window.addEventListener("resize", function () { renderPager(); loadHistory(selected); });
     composeLock();
     tick();
-    setInterval(tick, 1500);
+    pollTimer = setInterval(tick, 1500);
   }
   if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", init);
   else init();

@@ -32,15 +32,35 @@ $dbh->do('INSERT INTO zhc_users (id, email, email_verified) VALUES (2, ?, 1)', u
 $dbh->do('INSERT INTO zhc_users (id, email, email_verified) VALUES (3, ?, 0)', undef, 'todd@fdh.bz');
 $dbh->disconnect;
 
+sub php_s {
+    my ($s) = @_;
+    return 's:' . length($s) . ':"' . $s . '";';
+}
 sub write_sess {
-    my ($sid, $uid) = @_;
+    my ($sid, $body) = @_;
     open my $fh, '>', "$sdir/sess_$sid" or die $!;
-    print $fh "zhc_user_id|i:$uid;";
+    print $fh $body;
     close $fh;
 }
-write_sess('aaaaaaaaaaaaaaaa', 1);
-write_sess('bbbbbbbbbbbbbbbb', 2);
-write_sess('cccccccccccccccc', 3);
+write_sess('aaaaaaaaaaaaaaaa', 'zhc_user_id|i:1;');
+write_sess('bbbbbbbbbbbbbbbb', 'zhc_user_id|i:2;');
+write_sess('cccccccccccccccc', 'zhc_user_id|i:3;');
+# Same shape as a live account cookie: product id, copied email, account id.
+write_sess('dddddddddddddddd',
+    'user_id|i:9;email|' . php_s('todd@fdh.bz')
+    . 'display_name|' . php_s('Todd') . 'zhc_user_id|i:1;');
+write_sess('eeeeeeeeeeeeeeee',
+    'user_id|i:9;email|' . php_s('todd@fries.net')
+    . 'display_name|' . php_s('Todd') . 'zhc_user_id|i:2;');
+# Allowlisted id, but the copied email is the other account.
+write_sess('ffffffffffffffff',
+    'email|' . php_s('todd@fries.net') . 'zhc_user_id|i:1;');
+# A string value that contains another account's id must not win.
+my $bait = 'zhc_user_id|i:1;';
+write_sess('gggggggggggggggg',
+    'display_name|' . php_s($bait) . 'zhc_user_id|i:2;');
+write_sess('hhhhhhhhhhhhhhhh',
+    'zhc_user_id|i:1;zhc_new_tokens|a:1:{s:3:"api";s:3:"red";}');
 
 $ENV{HUB_SOCK}                 = $hsock;
 $ENV{HUB_LOG}                  = "$dir/hub.ndjson";
@@ -175,8 +195,22 @@ if ($up) {
     my $uv = fcgi_do('GET', '/dc/', '', cookie => $unv);
     ok($uv->{status} eq '403', 'unverified same address is 403');
 
+    my $live_fries = fcgi_do('GET', '/dc/', '', cookie => 'ZHCSESS_PROD=eeeeeeeeeeeeeeee');
+    ok($live_fries->{status} eq '403', 'real-shaped other account is 403');
+    my $mismatch = fcgi_do('GET', '/api/v1/dc/state', '', cookie => 'ZHCSESS_PROD=ffffffffffffffff');
+    ok($mismatch->{status} eq '403', 'allowlisted id with the other email is 403');
+    my $bait = fcgi_do('GET', '/api/v1/dc/state', '', cookie => 'ZHCSESS_PROD=gggggggggggggggg');
+    ok($bait->{status} eq '403', 'id planted in a string does not authorize');
+    my $both = fcgi_do('GET', '/dc/', '',
+        cookie => 'ZHCSESS_PROD=aaaaaaaaaaaaaaaa; ZHCSESS_PROD=bbbbbbbbbbbbbbbb');
+    ok($both->{status} eq '403', 'allowlisted cookie beside another sign-in is 403');
+    my $badboth = fcgi_do('GET', '/api/v1/dc/state', '',
+        cookie => 'ZHCSESS_PROD=aaaaaaaaaaaaaaaa; ZHCSESS_PROD=short');
+    ok($badboth->{status} eq '401', 'malformed second cookie is 401');
+
     my $page = fcgi_do('GET', '/dc/', '', cookie => $fdh);
     ok($page->{status} eq '200', 'allowlisted /dc/ is 200');
+    ok($page->{body} =~ /function bootOut/, 'open page leaves on 401 or 403');
     ok($page->{body} =~ m{/api/v1/dc/state}, 'page polls /api/v1/dc/state');
     ok($page->{body} =~ /compose-hint/, 'composer explains #system');
     ok($page->{body} !~ /altcha|llm_key/i, 'allowlisted page is not the setup form');
@@ -186,6 +220,14 @@ if ($up) {
     my $setup = fcgi_do('GET', '/api/setup/challenge', '', cookie => $fdh);
     ok($setup->{status} eq '404', 'setup API is not published');
     ok(($setup->{body} // '') !~ /altcha|challenge/i, 'setup 404 is not a challenge');
+
+    my $shaped = fcgi_do('GET', '/dc/', '', cookie => 'ZHCSESS_PROD=dddddddddddddddd');
+    ok($shaped->{status} eq '200', 'real-shaped allowlisted session is 200');
+    my $dup = fcgi_do('GET', '/api/v1/dc/state', '',
+        cookie => 'ZHCSESS_PROD=aaaaaaaaaaaaaaaa; ZHCSESS_PROD=aaaaaaaaaaaaaaaa');
+    ok($dup->{status} eq '200', 'the same allowlisted cookie twice is 200');
+    my $tokens = fcgi_do('GET', '/api/v1/dc/state', '', cookie => 'ZHCSESS_PROD=hhhhhhhhhhhhhhhh');
+    ok($tokens->{status} eq '200', 'session with an array value still allows');
 
     my $st = fcgi_do('GET', '/api/v1/dc/state', '', cookie => $fdh);
     my $sj = eval { decode_json($st->{body}) } || {};

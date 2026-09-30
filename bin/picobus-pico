@@ -56,7 +56,7 @@ for my $a (@agents) {
     $a->{q}          = {};      # sid => [queued pico frames]
     $a->{ws}         = {};      # sid => Mojo::Transaction::WebSocket
     $a->{ws_pending} = {};
-    $a->{sessions}   = {};      # sid => { from, content, flushed }
+    $a->{sessions}   = {};      # sid => { from, content, flushed, echo }
     $a->{hbuf}       = '';
 }
 
@@ -337,6 +337,14 @@ sub flush_session {
     my $content = $st->{content} // '';
     return unless length $content;
     return if ($st->{flushed} // '') eq $content;
+    # A reply to an echoed reply would ping-pong. Drop it. The model still
+    # saw the inbound text. bus.send does not set echo, so a new question
+    # still gets one answer.
+    if ($st->{echo}) {
+        $st->{flushed} = $content;
+        logmsg("$agent->{id} drop echo reply -> " . ($st->{from} // '') . " ($why)");
+        return;
+    }
     my $to = $st->{from} // '';
     return unless length $to;
     hub_write($agent, {
@@ -344,6 +352,7 @@ sub flush_session {
         from    => $agent->{id},
         to      => $to,
         content => $content,
+        echo    => 1,
     });
     $st->{flushed} = $content;
     logmsg("$agent->{id} reply -> $to ($why) bytes=" . length($content));
@@ -421,7 +430,17 @@ sub handle_hub_line {
     my $content = $obj->{content} // $obj->{body} // '';
     return unless length $content;
     my $sid = sid_for($from);
-    $agent->{sessions}{$sid}{from} = $from;
+    my $st = $agent->{sessions}{$sid} ||= {};
+    if ($agent->{idle}{$sid}) {
+        Mojo::IOLoop->remove($agent->{idle}{$sid});
+        delete $agent->{idle}{$sid};
+    }
+    # New inbound owns this session. Drop any unflushed text from the
+    # previous turn so it cannot ship under the new echo bit.
+    $st->{from}    = $from;
+    $st->{echo}    = $obj->{echo} ? 1 : 0;
+    $st->{content} = '';
+    $st->{flushed} = '';
     # Pico binds the WS connection to ?session_id=; replies go only to
     # connections in that session. Message session_id must match.
     pico_send($agent, $sid, {

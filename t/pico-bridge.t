@@ -125,6 +125,7 @@ sub connect_hub {
 }
 
 my $got;
+my $got_echo;
 if ($up && $ws_up && $reg) {
     my $c = connect_hub();
     print $c encode_json({ type => 'register', id => 'smoke' }), "\n";
@@ -144,6 +145,7 @@ if ($up && $ws_up && $reg) {
             next unless ($o->{from} // '') eq 'lab';
             if (($o->{content} // '') =~ /echo:.*ping-pico/) {
                 $got = 1;
+                $got_echo = (($o->{echo} // 0) ? 1 : 0);
                 last;
             }
         }
@@ -153,6 +155,42 @@ if ($up && $ws_up && $reg) {
     close $c;
 }
 ok($got, 'hub message round-trips through Pico WS');
+ok($got_echo, 'flushed reply is marked echo');
+
+my $bounced;
+my $echo_quiet;
+if ($got) {
+    my $c = connect_hub();
+    print $c encode_json({ type => 'register', id => 'smoke' }), "\n";
+    $c->flush;
+    select undef, undef, undef, 0.2;
+    print $c encode_json({
+        type    => 'message',
+        from    => 'smoke',
+        to      => 'lab',
+        content => 'second-ping',
+        echo    => 1,
+    }), "\n";
+    $c->flush;
+    eval {
+        local $SIG{ALRM} = sub { die "timeout\n" };
+        alarm 4;
+        while (my $line = <$c>) {
+            my $o = eval { decode_json($line) } or next;
+            next unless ($o->{type} // '') eq 'message';
+            next unless ($o->{from} // '') eq 'lab';
+            if (($o->{content} // '') =~ /second-ping/) {
+                $bounced = 1;
+                last;
+            }
+        }
+        alarm 0;
+    };
+    alarm 0;
+    $echo_quiet = 1 if !$bounced && $@ && $@ =~ /timeout/;
+    close $c;
+}
+ok($echo_quiet, 'echo reply is not written back to the hub');
 
 sub read_text {
     my ($path) = @_;
@@ -225,6 +263,7 @@ sub http_post_json {
 }
 
 my $todd_got;
+my $todd_echo;
 if ($up) {
     my $todd = connect_hub();
     print $todd encode_json({ type => 'register', id => 'todd' }), "\n";
@@ -240,6 +279,7 @@ if ($up) {
             next unless ($o->{type} // '') eq 'message';
             if (($o->{from} // '') eq 'lab' && ($o->{content} // '') eq 'hello-todd') {
                 $todd_got = 1;
+                $todd_echo = $o->{echo} ? 1 : 0;
                 last;
             }
         }
@@ -249,10 +289,11 @@ if ($up) {
     close $todd;
 }
 ok($todd_got, 'bus.send reaches a non-berth hub client');
+ok(!$todd_echo, 'bus.send is not marked echo');
 my $ack = read_text("$statedir/frames.ndjson");
 ok($ack =~ /"type":"bus\.ack"/, 'bus.ack returned on the control socket');
 
-if (!$got || !$dir_ok || !$pid_ok || !$todd_got) {
+if (!$got || !$got_echo || !$echo_quiet || !$dir_ok || !$pid_ok || !$todd_got || $todd_echo) {
     for my $f (qw(pico.out ws.out hub.out hub.ndjson)) {
         next unless -f "$dir/$f";
         print "--- $f ---\n";

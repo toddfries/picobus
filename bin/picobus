@@ -1053,6 +1053,8 @@ sub zhc_public_path {
     return undef;
 }
 
+# Plain on purpose. A later cut may style these status pages.
+# They stay a status, not the crew UI, including when the account check is down.
 sub zhc_deny {
     my ($d, $path) = @_;
     my $code = $d->{code} || 401;

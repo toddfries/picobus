@@ -75,6 +75,10 @@ of those reads the event log, or starts the agents that register.
 `/etc/picobus.conf` can set `PICOBUS_PRODUCT` and `PICOBUS_COOKIE`.
 Unset, the page title is `picobus` and theme cookies are `PICOBUS_*`.
 
+With `PICOBUS_ZHC_GATE=1`, a refused `/dc` page is only a status:
+Sign in required, Forbidden, or Unavailable. The plain look is enough
+for now. A later cut may style it. Do not replace it with the crew UI.
+
 Signup (`/api/setup`, ALTCHA, account page) writes the LLM key into
 `$PICOCLAW_HOME/.security.yml`. The model alias defaults to `default`;
 set `PICOBUS_LLM_ALIAS` to use another name.

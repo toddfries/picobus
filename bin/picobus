@@ -50,6 +50,12 @@ my $SHARE_DIR    = $ENV{SHARE_DIR};
 my $PICO_HOME    = $ENV{PICOCLAW_HOME};
 my $PRODUCT       = $ENV{PICOBUS_PRODUCT} // 'picobus';
 my $COOKIE_PREFIX = $ENV{PICOBUS_COOKIE}  // 'PICOBUS';
+# ZHC publish: one existing /account/ session. No second password, no API-key form.
+my $ZHC_GATE     = ($ENV{PICOBUS_ZHC_GATE} // '') eq '1';
+my $ZHC_EMAIL    = $ENV{PICOBUS_ZHC_EMAIL} // 'todd@fdh.bz';
+my $ZHC_COOKIE   = $ENV{PICOBUS_ZHC_COOKIE} // 'ZHCSESS_PROD';
+my $ZHC_SESS_DIR = $ENV{PICOBUS_ZHC_SESSION_DIR} // '/var/www/tmp/php-sessions-zhc-prod';
+my $ZHC_DB       = $ENV{PICOBUS_ZHC_DB} // '/var/www/data/escalate.sqlite';
 # -----------------------------------------
 
 umask $UMASK;
@@ -108,6 +114,20 @@ sub hub_sandbox {
         mkdir $PICO_HOME, 0700 unless -d $PICO_HOME;
         $dir{$PICO_HOME} = 'rwc';
     }
+    if ($ZHC_GATE) {
+        if ($ZHC_SESS_DIR =~ m{\A/} && $ZHC_SESS_DIR !~ m{\.\.} && -d $ZHC_SESS_DIR) {
+            $dir{$ZHC_SESS_DIR} = 'r';
+        } else {
+            die "ZHC session dir unavailable\n";
+        }
+        if ($ZHC_DB =~ m{\A/} && $ZHC_DB !~ m{\.\.} && -f $ZHC_DB) {
+            my $parent = _parent_dir($ZHC_DB);
+            die "ZHC account db unavailable\n" unless $parent && -d $parent;
+            $dir{$parent} = 'r' unless ($dir{$parent} // '') =~ /w/;
+        } else {
+            die "ZHC account db unavailable\n";
+        }
+    }
     for my $d (sort keys %dir) {
         unveil($d, $dir{$d}) or die "unveil $d: $!\n";
     }
@@ -131,9 +151,13 @@ if (!defined $SHARE_DIR || $SHARE_DIR eq '') {
     mkdir $state, 0755 if $state && !-d $state;
 }
 $PICO_HOME //= ($ENV{HOME} || '/root') . '/.picoclaw';
+# umask is for the sockets. chmod restores the directory mode it would strip.
 mkdir $FILE_DIR, 0755 unless -d $FILE_DIR;
+chmod 0755, $FILE_DIR if -d $FILE_DIR;
 mkdir $SECRETS_DIR, 0700 unless -d $SECRETS_DIR;
+chmod 0700, $SECRETS_DIR if -d $SECRETS_DIR;
 mkdir $PICO_HOME, 0700 unless -d $PICO_HOME;
+chmod 0700, $PICO_HOME if defined $PICO_HOME && -d $PICO_HOME;
 
 my $sel = IO::Select->new($hub);
 
@@ -543,6 +567,9 @@ sub fcgi_read_body {
 sub cgi_out {
     my ($headers, $body) = @_;
     $body //= '';
+    if (zhc_gate() && $headers !~ /X-Content-Type-Options:/i) {
+        $headers =~ s/\r\n\r\n/\r\nX-Content-Type-Options: nosniff\r\nX-Frame-Options: DENY\r\nReferrer-Policy: no-referrer\r\nX-Robots-Tag: noindex, nofollow\r\n\r\n/;
+    }
     if (defined $FCGI_BUF) {
         $FCGI_BUF .= $headers . $body;
         return;
@@ -566,6 +593,7 @@ sub json_out {
         200 => '200 OK',
         304 => '304 Not Modified',
         400 => '400 Bad Request',
+        401 => '401 Unauthorized',
         403 => '403 Forbidden',
         404 => '404 Not Found',
         405 => '405 Method Not Allowed',
@@ -752,7 +780,7 @@ sub save_upload {
         name  => $name,
         bytes => length($bytes),
         mime  => $mime,
-        url   => "/api/files/$id",
+        url   => (zhc_gate() ? '/api/v1/dc/files/' : '/api/files/') . $id,
     };
     if (open my $mf, '>', file_meta_path($id)) {
         print $mf encode_json($meta);
@@ -803,12 +831,195 @@ sub hub_state {
     };
 }
 
+sub zhc_gate { return $ZHC_GATE; }
+
+sub zhc_ct_eq {
+    my ($a, $b) = @_;
+    return 0 if !defined $a || !defined $b || length($a) != length($b);
+    my $d = 0;
+    for (my $i = 0; $i < length($a); $i++) {
+        $d |= ord(substr($a, $i, 1)) ^ ord(substr($b, $i, 1));
+    }
+    return $d == 0;
+}
+
+sub zhc_cookie_sid {
+    return '' if !defined $ZHC_COOKIE || $ZHC_COOKIE !~ /^[A-Za-z0-9_]{1,64}\z/;
+    my $raw = $ENV{HTTP_COOKIE} // '';
+    my $sid = '';
+    for my $part (split /;\s*/, $raw) {
+        my ($k, $v) = split /=/, $part, 2;
+        next unless defined $k && defined $v;
+        $k =~ s/^\s+//;
+        $sid = $v if $k eq $ZHC_COOKIE;
+    }
+    $sid =~ s/\s+\z//;
+    return '' unless $sid =~ /\A[A-Za-z0-9,-]{16,128}\z/;
+    return $sid;
+}
+
+# PHP session file. Integer id only. Missing or unreadable is "not signed in".
+sub zhc_session_uid {
+    return 0 if $ZHC_SESS_DIR !~ m{\A/} || $ZHC_SESS_DIR =~ m{\.\.};
+    my $sid = zhc_cookie_sid();
+    return 0 if $sid eq '';
+    my $path = $ZHC_SESS_DIR . '/sess_' . $sid;
+    my @st = lstat($path);
+    return 0 unless @st;
+    return 0 if -l _;
+    return 0 unless -f _;
+    return 0 if ($st[7] // 0) <= 0 || $st[7] > 65536;
+    open my $fh, '<', $path or return 0;
+    my $data = '';
+    my $n = read($fh, $data, 65536);
+    close $fh;
+    return 0 unless $n;
+    my $id;
+    if ($data =~ /zhc_user_id\|i:(\d+);/) {
+        $id = $1 + 0;
+    } elsif ($data =~ /zhc_user_id\|s:\d+:"(\d+)";/) {
+        $id = $1 + 0;
+    }
+    return ($id && $id > 0) ? $id : 0;
+}
+
+# ('ok', row) | ('miss') | ('err'). Read-only. Never interpolates the id into SQL.
+sub zhc_user_row {
+    my ($id) = @_;
+    return ('err') if !defined $id || $id !~ /\A\d+\z/ || $id < 1;
+    return ('err') if $ZHC_DB !~ m{\A/} || $ZHC_DB =~ m{\.\.} || $ZHC_DB =~ /[?#]/ || !-f $ZHC_DB;
+    require DBI;
+    require DBD::SQLite;
+    # immutable=1 reads the file without a WAL lock, so pledge can keep the
+    # account directory read-only. A checkpoint in flight fails this one call.
+    my $dbh = DBI->connect(
+        'dbi:SQLite:dbname=file://' . $ZHC_DB . '?immutable=1',
+        '', '', {
+            RaiseError => 0,
+            PrintError => 0,
+            sqlite_open_flags => DBD::SQLite::OPEN_READONLY() | DBD::SQLite::OPEN_URI(),
+        }
+    );
+    return ('err') unless $dbh;
+    $dbh->do('PRAGMA query_only = ON');
+    my $sth = $dbh->prepare(
+        'SELECT email, email_verified FROM zhc_users WHERE id = ?'
+    );
+    if (!$sth || !$sth->execute($id)) {
+        $dbh->disconnect;
+        return ('err');
+    }
+    my $row = $sth->fetchrow_hashref;
+    $sth->finish;
+    $dbh->disconnect;
+    return $row ? ('ok', $row) : ('miss');
+}
+
+sub zhc_authorize {
+    my $uid = zhc_session_uid();
+    return { ok => 0, code => 401, error => 'sign in required' } unless $uid;
+    my $allow = lc $ZHC_EMAIL;
+    $allow =~ s/^\s+|\s+$//g;
+    if ($allow eq '' || $allow !~ /\A[^\s@]+@[^\s@]+\z/) {
+        return { ok => 0, code => 503, error => 'unavailable' };
+    }
+    my ($st, $row) = zhc_user_row($uid);
+    return { ok => 0, code => 503, error => 'unavailable' } if $st eq 'err';
+    return { ok => 0, code => 403, error => 'forbidden' } if $st ne 'ok';
+    my $verified = ($row->{email_verified} // 0) + 0;
+    return { ok => 0, code => 403, error => 'forbidden' } if $verified != 1;
+    my $email = lc($row->{email} // '');
+    $email =~ s/^\s+|\s+$//g;
+    return { ok => 0, code => 403, error => 'forbidden' }
+        unless zhc_ct_eq(sha256_hex($email), sha256_hex($allow));
+    return { ok => 1, code => 200 };
+}
+
+# Page at /dc. API at /api/v1/dc/{state,history,send,files}. Nothing else.
+sub zhc_public_path {
+    my ($path) = @_;
+    $path = '/' unless defined $path && length $path;
+    return '/' if $path eq '/dc' || $path eq '/dc/' || $path eq '/dc/index.html';
+    if ($path =~ m{\A/api/v1/dc/(state|history|send)/?\z}i) {
+        return '/api/' . lc($1);
+    }
+    if ($path =~ m{\A/api/v1/dc/files/?\z}i) {
+        return '/api/files';
+    }
+    if ($path =~ m{\A/api/v1/dc/files/([0-9a-fA-F]+)(?:/.*)?\z}i) {
+        return '/api/files/' . lc($1);
+    }
+    return undef;
+}
+
+sub zhc_deny {
+    my ($d, $path) = @_;
+    my $code = $d->{code} || 401;
+    my $err  = $d->{error} || 'forbidden';
+    if (($path // '') =~ m{/api/}) {
+        json_out($code, { ok => \0, error => $err });
+        return;
+    }
+    my $title = $code == 401 ? 'Sign in required'
+        : $code == 403 ? 'Forbidden' : 'Unavailable';
+    my $extra = $code == 401
+        ? "<p>Sign in required.</p>\n<p><a href=\"/account/\">Sign in</a></p>\n"
+        : "<p>$title.</p>\n";
+    my $status = $code == 401 ? '401 Unauthorized'
+        : $code == 403 ? '403 Forbidden' : '503 Service Unavailable';
+    fcgi_print(
+        'text/html; charset=utf-8',
+        "<!DOCTYPE html>\n<html lang=\"en\"><head><meta charset=\"utf-8\">"
+        . "<title>$title</title></head><body>\n$extra</body></html>\n",
+        $status
+    );
+}
+
+sub zhc_not_ours {
+    my ($path) = @_;
+    if (($path // '') =~ m{/api/}) {
+        json_out(404, { ok => \0, error => 'not found' });
+        return;
+    }
+    fcgi_print('text/plain; charset=utf-8', "not found\n", '404 Not Found');
+}
+
+# A web send may name one connected berth. #system and groups are not destinations.
+sub zhc_target_ok {
+    my ($to) = @_;
+    $to = normalize_to($to);
+    return 0 if is_broadcast_to($to) || $to eq 'human' || $to =~ /^g:/;
+    return 0 if $channels{$to} && ($channels{$to}{kind} // '') eq 'group';
+    return 0 unless $agents{$to} && $agents{$to}{sock};
+    return 1;
+}
+
 sub handle_fcgi {
     my ($req) = @_;
     my $method = uc($ENV{REQUEST_METHOD} // 'GET');
     my $path   = fcgi_path();
     my $ctype  = $ENV{CONTENT_TYPE} // '';
     my $clen   = $ENV{CONTENT_LENGTH} // 0;
+    my $q = parse_urlencoded($ENV{QUERY_STRING} // '');
+    if (zhc_gate()) {
+        my $decision = zhc_authorize();
+        if (!$decision->{ok}) {
+            zhc_deny($decision, $path);
+            return;
+        }
+        my $mapped = zhc_public_path($path);
+        if (!defined $mapped) {
+            zhc_not_ours($path);
+            return;
+        }
+        $path = $mapped;
+        if ($path =~ m{\A/api/setup\b}i
+            || ($q->{setup} // '') ne ''
+            || ($q->{action} // '') eq 'altcha_challenge') {
+            json_out(404, { ok => \0, error => 'not found' });
+            return;
+        }
+    }
     my $is_upload = ($path =~ m{/api/files/?$}i && $method eq 'POST');
     my $max_body  = $is_upload ? $MAX_UPLOAD : 65536;
     if ($method eq 'POST' && $clen =~ /^\d+$/ && $clen > $max_body) {
@@ -816,7 +1027,6 @@ sub handle_fcgi {
         return;
     }
     my $body = ($method eq 'POST' || $method eq 'PUT') ? fcgi_read_body($max_body) : '';
-    my $q = parse_urlencoded($ENV{QUERY_STRING} // '');
     if ($method eq 'POST' && $ctype !~ m{json}i) {
         my $pq = parse_urlencoded($body);
         $q->{$_} = $pq->{$_} for keys %$pq;
@@ -910,7 +1120,7 @@ sub handle_fcgi {
         return;
     }
 
-    if ($method eq 'POST' && !setup_complete()
+    if (!zhc_gate() && $method eq 'POST' && !setup_complete()
         && $path =~ m{/api/(send|channels|files)}i) {
         json_out(503, { ok => \0, error => 'setup required' });
         return;
@@ -945,7 +1155,8 @@ sub handle_fcgi {
         my $mime = $meta->{mime} || 'application/octet-stream';
         my $disp = ($q->{dl} || $q->{download}) ? 'attachment' : 'inline';
         cgi_out(
-            "Status: 200 OK\r\nCache-Control: private, max-age=3600\r\n"
+            "Status: 200 OK\r\nCache-Control: "
+            . (zhc_gate() ? 'no-store' : 'private, max-age=3600') . "\r\n"
             . "Content-Type: $mime\r\n"
             . "Content-Length: " . length($data) . "\r\n"
             . "Content-Disposition: $disp; filename=\"$name\"\r\n\r\n",
@@ -1032,7 +1243,7 @@ sub handle_fcgi {
     my $want_json = ($path =~ m{/api/state/?$}i)
         || (($q->{format} // '') eq 'json');
 
-    if ($path =~ m{/api/send/?$}i
+    if (!zhc_gate() && $path =~ m{/api/send/?$}i
         && $method eq 'POST' && !setup_complete()) {
         json_out(503, { ok => \0, error => 'setup required' });
         return;
@@ -1052,6 +1263,10 @@ sub handle_fcgi {
             }
             $to      = $obj->{to};
             $content = $obj->{content};
+            if (zhc_gate() && !zhc_target_ok($to)) {
+                json_out(400, { ok => \0, error => 'pick a live berth' });
+                return;
+            }
             my @files;
             if ($obj->{files} && ref $obj->{files} eq 'ARRAY') {
                 for my $f (@{ $obj->{files} }) {
@@ -1069,6 +1284,10 @@ sub handle_fcgi {
         } else {
             $to      = $q->{to};
             $content = $q->{content};
+            if (zhc_gate() && !zhc_target_ok($to)) {
+                json_out(400, { ok => \0, error => 'pick a live berth' });
+                return;
+            }
         }
         if (!inject_human_message($to, $content)) {
             json_out(400, { ok => \0, error => 'content required' });
@@ -1079,9 +1298,14 @@ sub handle_fcgi {
     }
 
     if ($q->{send} && defined $q->{content} && length $q->{content}) {
+        if (zhc_gate() && !zhc_target_ok($q->{to})) {
+            json_out(400, { ok => \0, error => 'pick a live berth' });
+            return;
+        }
         inject_human_message($q->{to}, $q->{content});
         if (!$want_json && $method eq 'POST') {
-            cgi_out("Status: 303 See Other\r\nLocation: /\r\nCache-Control: no-store\r\n\r\n");
+            my $loc = zhc_gate() ? '/dc/' : '/';
+            cgi_out("Status: 303 See Other\r\nLocation: $loc\r\nCache-Control: no-store\r\n\r\n");
             return;
         }
     }
@@ -1094,6 +1318,11 @@ sub handle_fcgi {
     # /api/* is JSON only — never HTML (that was the "<!DOCTYPE" SyntaxError).
     if ($path =~ m{^/api/}i) {
         json_out(404, { ok => \0, error => 'not found' });
+        return;
+    }
+
+    if (zhc_gate()) {
+        fcgi_print('text/html; charset=utf-8', app_html());
         return;
     }
 
@@ -1123,8 +1352,12 @@ sub apply_brand {
     my $cookie = $COOKIE_PREFIX;
     $cookie =~ s/[^A-Za-z0-9_]//g;
     $cookie = 'PICOBUS' unless length $cookie;
+    my $api  = zhc_gate() ? '/api/v1/dc' : '/api';
+    my $page = zhc_gate() ? '/dc/' : '/';
     $html =~ s/__PRODUCT__/$name/g;
     $html =~ s/__COOKIE__/$cookie/g;
+    $html =~ s/__API__/$api/g;
+    $html =~ s/__PAGE__/$page/g;
     return $html;
 }
 
@@ -1357,6 +1590,9 @@ textarea::placeholder { color:var(--sys); }
 .compose-box > label.ico { padding:8px 10px; background:var(--sel); }
 .compose-box > button:hover { filter:brightness(1.08); }
 .pending { font-size:12px; color:var(--muted); padding:4px 16px 0; }
+.hint { margin:0; padding:8px 16px 0; color:var(--muted); font-size:13px; }
+.hint[hidden] { display:none; }
+textarea:disabled { opacity:.55; }
 .transcript::-webkit-scrollbar,#channels::-webkit-scrollbar { width:8px; }
 .transcript::-webkit-scrollbar-thumb,#channels::-webkit-scrollbar-thumb {
   background:#1a1b1e; border-radius:4px;
@@ -1382,7 +1618,8 @@ textarea::placeholder { color:var(--sys); }
       <nav class="pager" id="pager" aria-label="history pages"></nav>
     </div>
     <div class="pending" id="pending"></div>
-    <form class="compose" id="composer" method="POST" action="/">
+    <p class="hint" id="compose-hint">Pick a berth. #system is a log, not a destination.</p>
+    <form class="compose" id="composer" method="POST" action="__PAGE__">
       <input type="hidden" name="to" id="to-field" value="all">
       <input type="hidden" name="send" value="send">
       <input type="file" id="file-input" hidden multiple>
@@ -1397,6 +1634,7 @@ textarea::placeholder { color:var(--sys); }
 <script>
 (function () {
   var selected = "all";
+  var pinned = false;
   var lastAgentsRaw = "";
   var lastData = { agents: [], scores: {}, seq: 0 };
   var paneMap = {};
@@ -1491,15 +1729,30 @@ textarea::placeholder { color:var(--sys); }
     });
     pane = paneMap[id].el;
   }
-  function selectTarget(id) {
+  function composeLock() {
+    var lock = !selected || selected === "all" || selected.indexOf("g:") === 0;
+    if (content) {
+      content.disabled = lock;
+      if (lock) content.placeholder = "Pick a berth";
+    }
+    var hint = $("compose-hint");
+    if (hint) hint.hidden = !lock;
+    var btn = composer ? composer.querySelector("button[type=submit]") : null;
+    if (btn) btn.disabled = lock;
+  }
+  function selectTarget(id, fromUser) {
+    if (fromUser) pinned = true;
     selected = id || "all";
     if (toField) toField.value = selected;
     var label = channelLabel(selected);
     if (head) head.textContent = label;
-    if (content) content.placeholder = "Message " + label;
+    if (content && !(!selected || selected === "all" || selected.indexOf("g:") === 0)) {
+      content.placeholder = "Message " + label;
+    }
     showPane(selected);
     renderChannels(lastData.agents || []);
     loadHistory(selected);
+    composeLock();
   }
   function channelLabel(id) {
     if (!id || id === "all") return "#system";
@@ -1570,7 +1823,7 @@ textarea::placeholder { color:var(--sys); }
   function fileChip(f) {
     var id = f.id || "";
     var name = f.name || "file";
-    var href = "/api/files/" + encodeURIComponent(id);
+    var href = "__API__/files/" + encodeURIComponent(id);
     var dl = href + "?dl=1";
     return '<div class="filechip" data-id="' + esc(id) + '" data-name="' + esc(name) + '" data-mime="' + esc(f.mime || "") + '" data-bytes="' + esc(f.bytes || 0) + '">'
       + '<a class="name" href="' + href + '" target="_blank" rel="noopener">' + esc(name) + "</a>"
@@ -1637,7 +1890,7 @@ textarea::placeholder { color:var(--sys); }
     chan = chan || selected;
     var st = ensurePane(chan);
     var page = st.follow ? "last" : String(st.page || "last");
-    var url = "/api/history?channel=" + encodeURIComponent(chan)
+    var url = "__API__/history?channel=" + encodeURIComponent(chan)
       + "&page=" + encodeURIComponent(page) + "&lines=" + linesPer();
     var isLast = st.follow || page === "last";
     fetch(url, { cache: isLast ? "no-store" : "default" }).then(function (r) {
@@ -1667,6 +1920,15 @@ textarea::placeholder { color:var(--sys); }
       for (var i = 0; i < agents.length; i++) ensurePane(agents[i].id);
       renderChannels(agents);
     }
+    if (!pinned) {
+      var roster = data.agents || [];
+      for (var k = 0; k < roster.length; k++) {
+        if (roster[k].id === "zhc" && roster[k].connected && selected !== "zhc") {
+          selectTarget("zhc", false);
+          return;
+        }
+      }
+    }
     var st = paneMap[selected] || ensurePane(selected);
     if (st.seq !== seq) {
       if (st.follow) loadHistory(selected);
@@ -1674,7 +1936,7 @@ textarea::placeholder { color:var(--sys); }
     }
   }
   function tick() {
-    fetch("/api/state", { cache: "no-store" }).then(function (r) { return r.json(); }).then(applyAgents).catch(function () {});
+    fetch("__API__/state", { cache: "no-store" }).then(function (r) { return r.json(); }).then(applyAgents).catch(function () {});
   }
   function refreshPending() {
     if (!pendingEl) return;
@@ -1684,7 +1946,7 @@ textarea::placeholder { color:var(--sys); }
     }).join(" · ");
   }
   function uploadFile(file) {
-    var q = "/api/files?name=" + encodeURIComponent(file.name)
+    var q = "__API__/files?name=" + encodeURIComponent(file.name)
       + "&mime=" + encodeURIComponent(file.type || "application/octet-stream");
     return fetch(q, { method: "POST", body: file }).then(function (r) { return r.json(); }).then(function (j) {
       if (j && j.ok && j.id) pendingFiles.push(j);
@@ -1693,13 +1955,14 @@ textarea::placeholder { color:var(--sys); }
   }
   function send(ev) {
     if (ev) ev.preventDefault();
+    if (!selected || selected === "all" || selected.indexOf("g:") === 0) return;
     var text = (content.value || "").replace(/^\s+|\s+$/g, "");
     if (!text && !pendingFiles.length) return;
     var to = selected || "all";
     var files = pendingFiles.map(function (f) {
       return { id: f.id, name: f.name, bytes: f.bytes, mime: f.mime };
     });
-    fetch("/api/send", {
+    fetch("__API__/send", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ to: to, content: text, files: files })
@@ -1728,7 +1991,7 @@ textarea::placeholder { color:var(--sys); }
     var id = chip.getAttribute("data-id");
     var name = chip.getAttribute("data-name") || "file";
     var mime = chip.getAttribute("data-mime") || "application/octet-stream";
-    var href = "/api/files/" + encodeURIComponent(id);
+    var href = "__API__/files/" + encodeURIComponent(id);
     if (act === "dl") {
       var a = document.createElement("a");
       a.href = href + "?dl=1";
@@ -1777,7 +2040,7 @@ textarea::placeholder { color:var(--sys); }
     channels.addEventListener("click", function (e) {
       var el = e.target;
       while (el && el !== channels && !(el.getAttribute && el.getAttribute("data-id"))) el = el.parentNode;
-      if (el && el.getAttribute && el.getAttribute("data-id")) selectTarget(el.getAttribute("data-id"));
+      if (el && el.getAttribute && el.getAttribute("data-id")) selectTarget(el.getAttribute("data-id"), true);
     });
     if (pager) pager.addEventListener("click", function (e) {
       var el = e.target;
@@ -1798,6 +2061,7 @@ textarea::placeholder { color:var(--sys); }
       chain.then(function () { fileInput.value = ""; });
     });
     window.addEventListener("resize", function () { renderPager(); loadHistory(selected); });
+    composeLock();
     tick();
     setInterval(tick, 1500);
   }
@@ -1965,11 +2229,23 @@ if ($DO_FCGI) {
         Listen => 32,
     ) or die "fcgi listen $FCGI_SOCK: $!\n";
     $fcgi_listen_fh->blocking(0);
-    chmod 0666, $FCGI_SOCK;
+    my $fmode = $ENV{PICOBUS_FCGI_MODE} // '0666';
+    chmod oct($fmode), $FCGI_SOCK;
+    if (defined $ENV{PICOBUS_FCGI_GROUP} && $ENV{PICOBUS_FCGI_GROUP} ne '') {
+        my $gid = getgrnam($ENV{PICOBUS_FCGI_GROUP});
+        die "PICOBUS_FCGI_GROUP $ENV{PICOBUS_FCGI_GROUP}: unknown group\n"
+            unless defined $gid;
+        my $uid = (stat $FCGI_SOCK)[4];
+        chown $uid, $gid, $FCGI_SOCK or die "chown $FCGI_SOCK: $!\n";
+    }
     $sel->add($fcgi_listen_fh);
     $DO_FCGI = 1;
 }
 
+if ($ZHC_GATE) {
+    require DBI;
+    require DBD::SQLite;
+}
 hub_sandbox();
 
 print STDERR "picobus listening agents=$HUB_SOCK fcgi=", ($DO_FCGI ? ($FCGI_SOCK // 'stdin') : 'off'), "\n";

@@ -1,0 +1,263 @@
+#!/usr/bin/perl
+# hub-dc-gate.t — /dc and /api/v1/dc/* require one ZHC session.
+# usage: perl t/hub-dc-gate.t
+
+use strict;
+use warnings;
+use FindBin;
+use File::Temp qw(tempdir);
+use IO::Socket::UNIX;
+use JSON::PP qw(encode_json decode_json);
+use DBI;
+
+my ($pass, $fail) = (0, 0);
+sub ok {
+    my ($cond, $name) = @_;
+    if ($cond) { $pass++; print "ok - $name\n" }
+    else       { $fail++; print "NOT OK - $name\n" }
+    return $cond ? 1 : 0;
+}
+
+my $dir   = tempdir(CLEANUP => 1);
+my $sdir  = "$dir/sessions";
+my $db    = "$dir/users.sqlite";
+my $hsock = "$dir/hub.sock";
+my $fsock = "$dir/fcgi.sock";
+mkdir $sdir, 0700 or die "mkdir: $!";
+
+my $dbh = DBI->connect("dbi:SQLite:dbname=$db", '', '', { RaiseError => 1, PrintError => 0 });
+$dbh->do('CREATE TABLE zhc_users (id INTEGER PRIMARY KEY, email TEXT, email_verified INTEGER)');
+$dbh->do('INSERT INTO zhc_users (id, email, email_verified) VALUES (1, ?, 1)', undef, 'todd@fdh.bz');
+$dbh->do('INSERT INTO zhc_users (id, email, email_verified) VALUES (2, ?, 1)', undef, 'todd@fries.net');
+$dbh->do('INSERT INTO zhc_users (id, email, email_verified) VALUES (3, ?, 0)', undef, 'todd@fdh.bz');
+$dbh->disconnect;
+
+sub write_sess {
+    my ($sid, $uid) = @_;
+    open my $fh, '>', "$sdir/sess_$sid" or die $!;
+    print $fh "zhc_user_id|i:$uid;";
+    close $fh;
+}
+write_sess('aaaaaaaaaaaaaaaa', 1);
+write_sess('bbbbbbbbbbbbbbbb', 2);
+write_sess('cccccccccccccccc', 3);
+
+$ENV{HUB_SOCK}                 = $hsock;
+$ENV{HUB_LOG}                  = "$dir/hub.ndjson";
+$ENV{FCGI_SOCK}                = $fsock;
+$ENV{CHAT_LOG}                 = "$dir/chat.ndjson";
+$ENV{FILE_DIR}                 = "$dir/files";
+$ENV{SETUP_FILE}               = "$dir/setup.json";
+$ENV{SECRETS_DIR}              = "$dir/secrets";
+$ENV{ROSTER_FILE}              = "$dir/roster.json";
+$ENV{PICOCLAW_HOME}            = "$dir/pico";
+$ENV{HUB_NOSANDBOX}            = 1;
+$ENV{PICOBUS_ZHC_GATE}         = 1;
+$ENV{PICOBUS_ZHC_EMAIL}        = 'todd@fdh.bz';
+$ENV{PICOBUS_ZHC_COOKIE}       = 'ZHCSESS_PROD';
+$ENV{PICOBUS_ZHC_SESSION_DIR}  = $sdir;
+$ENV{PICOBUS_ZHC_DB}           = $db;
+delete $ENV{HUB_NOFCGI};
+delete $ENV{PICOBUS_FCGI_GROUP};
+
+my $pid = fork();
+die "fork: $!" unless defined $pid;
+if ($pid == 0) {
+    open STDOUT, '>', "$dir/hub.out";
+    open STDERR, '>&STDOUT';
+    exec $^X, "$FindBin::Bin/../bin/picobus" or exit 127;
+}
+
+my $up;
+for (1 .. 50) {
+    if (-S $fsock && -S $hsock) { $up = 1; last }
+    select undef, undef, undef, 0.1;
+}
+ok($up, 'gated hub listening');
+
+sub fcgi_nv {
+    my ($k, $v) = @_;
+    $v = '' unless defined $v;
+    my $n = length $k;
+    my $m = length $v;
+    my $out = $n < 128 ? pack('C', $n) : pack('N', $n | 0x80000000);
+    $out .= $m < 128 ? pack('C', $m) : pack('N', $m | 0x80000000);
+    return $out . $k . $v;
+}
+sub fcgi_rec {
+    my ($type, $id, $content) = @_;
+    $content //= '';
+    my $clen = length $content;
+    my $pad  = (8 - ($clen % 8)) % 8;
+    return pack('CCnnCC', 1, $type, $id, $clen, $pad, 0) . $content . ("\0" x $pad);
+}
+sub fcgi_readn {
+    my ($fh, $n) = @_;
+    my $buf = '';
+    while (length($buf) < $n) {
+        my $r = read($fh, my $chunk, $n - length($buf));
+        return undef if !defined $r || $r == 0;
+        $buf .= $chunk;
+    }
+    return $buf;
+}
+sub fcgi_do {
+    my ($method, $uri, $body, %extra) = @_;
+    my $c = IO::Socket::UNIX->new(Peer => $fsock, Type => SOCK_STREAM)
+        or return { err => "connect: $!" };
+    $c->autoflush(1);
+    my ($path, $qs) = split /\?/, $uri, 2;
+    $qs //= '';
+    $body //= '';
+    my %env = (
+        REQUEST_METHOD  => $method,
+        REQUEST_URI     => $uri,
+        SCRIPT_NAME     => $path,
+        QUERY_STRING    => $qs,
+        CONTENT_LENGTH  => length($body),
+        CONTENT_TYPE    => $extra{ctype} // (length($body) ? 'application/json' : ''),
+        SERVER_PROTOCOL => 'HTTP/1.0',
+    );
+    $env{HTTP_COOKIE} = $extra{cookie} if defined $extra{cookie};
+    print $c fcgi_rec(1, 1, pack('nC', 1, 0) . ("\0" x 6));
+    my $params = '';
+    $params .= fcgi_nv($_, $env{$_}) for sort keys %env;
+    print $c fcgi_rec(4, 1, $params);
+    print $c fcgi_rec(4, 1, '');
+    print $c fcgi_rec(5, 1, $body);
+    print $c fcgi_rec(5, 1, '');
+    my $out = '';
+    eval {
+        local $SIG{ALRM} = sub { die "timeout" };
+        alarm 8;
+        while (1) {
+            my $hdr = fcgi_readn($c, 8);
+            last unless defined $hdr;
+            my ($ver, $type, $id, $clen, $pad) = unpack('CCnnC', $hdr);
+            my $content = $clen ? fcgi_readn($c, $clen) : '';
+            fcgi_readn($c, $pad) if $pad;
+            last unless defined $content;
+            $out .= $content if $type == 6;
+            last if $type == 3;
+        }
+        alarm 0;
+    };
+    alarm 0;
+    close $c;
+    my ($head, $b) = split /\r\n\r\n/, $out, 2;
+    $b //= '';
+    my $st = ($head // '') =~ /Status:\s*(\d+)/i ? $1 : '';
+    return { status => $st, head => $head // '', body => $b };
+}
+
+my $fdh   = 'ZHCSESS_PROD=aaaaaaaaaaaaaaaa';
+my $fries = 'ZHCSESS_PROD=bbbbbbbbbbbbbbbb';
+my $unv   = 'ZHCSESS_PROD=cccccccccccccccc';
+
+if ($up) {
+    my $anon = fcgi_do('GET', '/dc/');
+    ok($anon->{status} eq '401', 'unsigned /dc/ is 401');
+    ok($anon->{body} =~ /Sign in required/, 'unsigned page says sign in');
+    ok($anon->{body} !~ /zhc-ops|altcha|llm_key/i, 'unsigned page has no transcript or setup');
+    ok($anon->{head} =~ /X-Frame-Options: DENY/i, 'unsigned page denies frames');
+
+    my $api = fcgi_do('GET', '/api/v1/dc/state');
+    ok($api->{status} eq '401', 'unsigned state is 401');
+    my $aj = eval { decode_json($api->{body}) } || {};
+    ok($aj->{error} && $aj->{error} eq 'sign in required', 'unsigned state JSON');
+    ok($api->{body} !~ /<!DOCTYPE/, 'unsigned state is not HTML');
+
+    my $bad = fcgi_do('GET', '/api/v1/dc/state', '', cookie => 'ZHCSESS_PROD=../../../../etc/passwd');
+    ok($bad->{status} eq '401', 'path-like session id is 401');
+
+    my $other = fcgi_do('GET', '/api/v1/dc/state', '', cookie => $fries);
+    ok($other->{status} eq '403', 'other verified account is 403');
+    my $uv = fcgi_do('GET', '/dc/', '', cookie => $unv);
+    ok($uv->{status} eq '403', 'unverified same address is 403');
+
+    my $page = fcgi_do('GET', '/dc/', '', cookie => $fdh);
+    ok($page->{status} eq '200', 'allowlisted /dc/ is 200');
+    ok($page->{body} =~ m{/api/v1/dc/state}, 'page polls /api/v1/dc/state');
+    ok($page->{body} =~ /compose-hint/, 'composer explains #system');
+    ok($page->{body} !~ /altcha|llm_key/i, 'allowlisted page is not the setup form');
+
+    my $root = fcgi_do('GET', '/', '', cookie => $fdh);
+    ok($root->{status} eq '404', 'gate does not serve /');
+    my $setup = fcgi_do('GET', '/api/setup/challenge', '', cookie => $fdh);
+    ok($setup->{status} eq '404', 'setup API is not published');
+    ok(($setup->{body} // '') !~ /altcha|challenge/i, 'setup 404 is not a challenge');
+
+    my $st = fcgi_do('GET', '/api/v1/dc/state', '', cookie => $fdh);
+    my $sj = eval { decode_json($st->{body}) } || {};
+    ok($st->{status} eq '200' && ref($sj->{agents}) eq 'ARRAY', 'allowlisted state JSON');
+
+    my $rx = IO::Socket::UNIX->new(Peer => $hsock, Type => SOCK_STREAM);
+    ok($rx, 'agent socket');
+    if ($rx) {
+        $rx->autoflush(1);
+        print $rx encode_json({ type => 'register', id => 'zhc' }), "\n";
+        select undef, undef, undef, 0.2;
+        my $no = fcgi_do('POST', '/api/v1/dc/send',
+            encode_json({ to => 'all', content => 'nope-all' }),
+            cookie => $fdh);
+        ok($no->{status} eq '400', 'to=all is refused')
+            or print "# all status=$no->{status} body=$no->{body}\n";
+        my $yes = fcgi_do('POST', '/api/v1/dc/send',
+            encode_json({ to => 'zhc', content => 'hello captain' }),
+            cookie => $fdh);
+        ok($yes->{status} eq '200', 'send to a live berth is 200')
+            or print "# send status=$yes->{status} body=$yes->{body}\n";
+        my $saw = 0;
+        my $saw_all = 0;
+        eval {
+            local $SIG{ALRM} = sub { die "timeout" };
+            alarm 2;
+            while (my $line = <$rx>) {
+                $saw_all = 1 if $line =~ /nope-all/;
+                if ($line =~ /hello captain/) { $saw = 1; last }
+            }
+            alarm 0;
+        };
+        alarm 0;
+        ok($saw && !$saw_all, 'berth got the line and not the all-send');
+    } else {
+        ok(0, 'to=all refused');
+        ok(0, 'send 200');
+        ok(0, 'berth received');
+    }
+
+    my $upl = fcgi_do('POST', '/api/v1/dc/files?name=note.txt', 'hello-file',
+        ctype => 'text/plain', cookie => $fdh);
+    my $uj = eval { decode_json($upl->{body}) } || {};
+    ok($upl->{status} eq '200' && $uj->{id}, 'allowlisted upload')
+        or print "# upload status=$upl->{status} body=$upl->{body}\n";
+    ok((($uj->{url} // '') =~ m{^/api/v1/dc/files/} ? 1 : 0), 'upload url stays under /api/v1/dc');
+    if ($uj->{id}) {
+        my $hid = fcgi_do('GET', "/api/v1/dc/files/$uj->{id}");
+        ok($hid->{status} eq '401', 'unsigned download is 401');
+        my $nope = fcgi_do('GET', "/api/v1/dc/files/$uj->{id}", '', cookie => $fries);
+        ok($nope->{status} eq '403', 'other account download is 403');
+        my $got = fcgi_do('GET', "/api/v1/dc/files/$uj->{id}", '', cookie => $fdh);
+        ok($got->{status} eq '200' && $got->{body} eq 'hello-file', 'allowlisted download');
+    } else {
+        ok(0, 'unsigned download');
+        ok(0, 'other download');
+        ok(0, 'allowlisted download');
+    }
+} else {
+    if (open my $err, '<', "$dir/hub.out") {
+        local $/;
+        print "hub stderr: ", <$err> // '', "\n";
+        close $err;
+    }
+}
+
+if ($pid) {
+    kill 'TERM', $pid;
+    select undef, undef, undef, 0.2;
+    kill 'KILL', $pid;
+    waitpid($pid, 0);
+}
+
+print $fail ? "FAIL $fail  pass $pass\n" : "PASS $pass\n";
+exit($fail ? 1 : 0);

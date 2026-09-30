@@ -1658,7 +1658,24 @@ body {
 .msg.me .who { color:var(--me); }
 .msg .to { color:var(--muted); font-size:12px; margin-right:8px; }
 .msg .ts { color:var(--sys); font-size:12px; }
-.msg .body { white-space:pre-wrap; word-wrap:break-word; }
+.msg .body { word-wrap:break-word; }
+.msg .body p { margin:0 0 .55em; white-space:pre-wrap; }
+.msg .body p:last-child { margin-bottom:0; }
+.msg .body h1,.msg .body h2,.msg .body h3,
+.msg .body h4,.msg .body h5,.msg .body h6 {
+  margin:.15em 0 .35em; color:var(--head); font-weight:700;
+  line-height:1.25; white-space:pre-wrap;
+}
+.msg .body h1 { font-size:1.2em; }
+.msg .body h2 { font-size:1.1em; }
+.msg .body h3,.msg .body h4,.msg .body h5,.msg .body h6 { font-size:1em; }
+.msg .body ul,.msg .body ol { margin:0 0 .55em; padding-left:1.25em; }
+.msg .body li { white-space:pre-wrap; }
+.msg .body code {
+  font:12.5px/1.35 ui-monospace,Menlo,monospace;
+  background:#2b2d31; padding:0 .3em; border-radius:3px;
+}
+.msg .body strong { font-weight:700; }
 .msg.sys { color:var(--sys); font-size:13px; }
 .msg.sys .ts { margin-left:8px; }
 .filechip {
@@ -1746,6 +1763,78 @@ textarea:disabled { opacity:.55; }
     return String(s == null ? "" : s).replace(/[&<>"']/g, function (c) {
       return { "&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#39;" }[c];
     });
+  }
+  // Chat markdown is a closed set of tags. Escape first so a message cannot
+  // introduce HTML. A marker that does not pair stays as text.
+  function inlineMd(text) {
+    var s = esc(text).replace(/\u0000/g, "");
+    var codes = [];
+    s = s.replace(/`([^`]+)`/g, function (m, c) {
+      codes.push(c);
+      return "\u0000" + (codes.length - 1) + "\u0000";
+    });
+    s = s.replace(/\*\*([^*\n]+)\*\*/g, "<strong>$1</strong>");
+    s = s.replace(/(^|[^A-Za-z0-9*])\*([^*\n]+)\*/g, function (m, pre, t) {
+      return pre + "<em>" + t + "</em>";
+    });
+    s = s.replace(/\u0000(\d+)\u0000/g, function (m, i) {
+      return "<code>" + codes[+i] + "</code>";
+    });
+    return s;
+  }
+  function renderMd(src) {
+    var lines = String(src == null ? "" : src).replace(/\u0000/g, "").replace(/\r\n/g, "\n").replace(/\r/g, "\n").split("\n");
+    var html = "";
+    var para = [];
+    var i = 0;
+    function flushPara() {
+      if (!para.length) return;
+      html += "<p>" + para.join("<br>") + "</p>";
+      para = [];
+    }
+    function blank(line) { return line.replace(/[ \t]+$/, "") === ""; }
+    function ulLine(line) { var m = /^[-*] (.*)$/.exec(line); return m ? m[1] : null; }
+    function olLine(line) {
+      var m = /^(\d+)\. (.*)$/.exec(line);
+      if (!m || m[1].length > 6) return null;
+      return { n: +m[1], t: m[2] };
+    }
+    while (i < lines.length) {
+      var line = lines[i];
+      if (blank(line)) { flushPara(); i++; continue; }
+      var hm = /^(#{1,6}) (.+)$/.exec(line);
+      if (hm) {
+        flushPara();
+        html += "<h" + hm[1].length + ">" + inlineMd(hm[2]) + "</h" + hm[1].length + ">";
+        i++;
+        continue;
+      }
+      var item = ulLine(line);
+      var ord = item == null ? olLine(line) : null;
+      if (item != null || ord) {
+        flushPara();
+        if (ord) {
+          html += ord.n === 1 ? "<ol>" : "<ol start=\"" + ord.n + "\">";
+          while (i < lines.length && (ord = olLine(lines[i]))) {
+            html += "<li>" + inlineMd(ord.t) + "</li>";
+            i++;
+          }
+          html += "</ol>";
+        } else {
+          html += "<ul>";
+          while (i < lines.length && (item = ulLine(lines[i])) != null) {
+            html += "<li>" + inlineMd(item) + "</li>";
+            i++;
+          }
+          html += "</ul>";
+        }
+        continue;
+      }
+      para.push(inlineMd(line));
+      i++;
+    }
+    flushPara();
+    return html;
   }
   function nearBottom(el) {
     return el.scrollHeight - el.scrollTop - el.clientHeight <= 64;
@@ -1913,7 +2002,7 @@ textarea:disabled { opacity:.55; }
     var files = m.files || [];
     var chips = "";
     for (var i = 0; i < files.length; i++) chips += fileChip(files[i]);
-    var body = m.content ? '<div class="body">' + esc(m.content) + "</div>" : "";
+    var body = m.content ? '<div class="body">' + renderMd(m.content) + "</div>" : "";
     return '<div class="msg' + (who === "human" ? " me" : "") + '">'
       + '<div class="meta"><span class="who">' + esc(who) + "</span>"
       + '<span class="to">→ ' + esc(dest) + "</span>"

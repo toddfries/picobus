@@ -66,6 +66,236 @@ $ua->request_timeout(0);
 $ua->inactivity_timeout(90);
 $ua->max_redirects(0);
 
+# Card file lives under dir/, not the state root. /var/picobus is root-owned
+# and not writable by _picobus; secrets sit beside it. dir/ is 0750 _picobus:picobus.
+my $DIR_FILE = $ENV{PICO_DIRECTORY} // '/var/picobus/dir/directory.json';
+my $POLL     = $ENV{PICO_POLL}      // 20;
+my $HUB_LOG  = $ENV{HUB_LOG}        // '/var/picobus/hub-events.ndjson';
+$POLL = 20 if !$POLL || $POLL < 1;
+
+my %cards;
+my $digest = '';
+
+sub iso_now {
+    my @t = gmtime;
+    sprintf("%04d-%02d-%02dT%02d:%02d:%02dZ",
+        $t[5] + 1900, $t[4] + 1, $t[3], $t[2], $t[1], $t[0]);
+}
+
+sub control_sid {
+    my ($agent) = @_;
+    return 'pb.' . $agent->{id};
+}
+
+sub card_digest {
+    my @parts;
+    for my $id (sort keys %cards) {
+        my $c = $cards{$id};
+        push @parts, join("\t", $id, $c->{nick} // '', $c->{role} // '');
+    }
+    return join("\n", @parts);
+}
+
+sub endpoint_list {
+    my @out;
+    for my $id (sort keys %cards) {
+        my $c = $cards{$id};
+        push @out, {
+            id       => $id,
+            nick     => $c->{nick},
+            role     => $c->{role},
+            host     => $c->{host} // '',
+            port     => 0 + ($c->{port} // 0),
+            health   => $c->{health} // 'unknown',
+            ready    => $c->{ready} // 'unknown',
+            pid      => $c->{pid},
+            seen     => $c->{seen} // '',
+            presence => $c->{presence} // 'down',
+        };
+    }
+    return \@out;
+}
+
+sub save_directory {
+    my $body = encode_json({
+        digest    => $digest,
+        endpoints => endpoint_list(),
+    });
+    my $tmp = "$DIR_FILE.tmp.$$";
+    if (open my $fh, '>', $tmp) {
+        print $fh $body, "\n";
+        close $fh;
+        if (rename $tmp, $DIR_FILE) {
+            chmod 0640, $DIR_FILE;
+            if (my $gid = getgrnam('picobus')) {
+                chown -1, $gid, $DIR_FILE;
+            }
+        }
+        else {
+            logmsg("directory rename: $!");
+        }
+    }
+    else {
+        logmsg("directory write $tmp: $!");
+    }
+}
+
+sub load_directory {
+    return unless -f $DIR_FILE;
+    open my $fh, '<', $DIR_FILE or return;
+    local $/;
+    my $raw = <$fh> // '';
+    close $fh;
+    my $obj = eval { decode_json($raw) } or return;
+    for my $ep (@{ $obj->{endpoints} || [] }) {
+        next unless $ep && ref $ep eq 'HASH' && ($ep->{id} // '') ne '';
+        $cards{$ep->{id}} = { %$ep };
+    }
+    $digest = card_digest();
+}
+
+sub send_directory_frame {
+    my ($agent) = @_;
+    my $sid = control_sid($agent);
+    pico_send($agent, $sid, {
+        type       => 'directory',
+        session_id => $sid,
+        payload    => {
+            digest    => $digest,
+            endpoints => endpoint_list(),
+        },
+    });
+}
+
+sub note_digest {
+    my $new = card_digest();
+    my $changed = $new ne $digest;
+    $digest = $new;
+    save_directory();
+    return unless $changed;
+    logmsg("directory digest changed");
+    send_directory_frame($_) for @agents;
+}
+
+sub is_our_berth {
+    my ($id) = @_;
+    return grep { $_->{id} eq $id } @agents;
+}
+
+sub skip_peer_id {
+    my ($id) = @_;
+    return 1 if !defined $id || $id eq '' || $id eq 'all' || $id eq 'human';
+    return 1 if $id =~ /^hubctl-\d+$/;
+    return 1 if $id =~ /^anon-/;
+    return 1 if is_our_berth($id);
+    return 0;
+}
+
+sub refresh_hub_peers {
+    return unless -f $HUB_LOG;
+    open my $fh, '<', $HUB_LOG or return;
+    my %st;
+    while (my $line = <$fh>) {
+        my $o = eval { decode_json($line) } or next;
+        my $t = $o->{type} // '';
+        my $id = $o->{id} // next;
+        if ($t eq 'register')    { $st{$id} = 'up' }
+        elsif ($t eq 'disconnect') { $st{$id} = 'down' }
+    }
+    close $fh;
+    for my $id (keys %st) {
+        next if skip_peer_id($id);
+        my $c = $cards{$id} ||= {
+            id   => $id,
+            nick => $id,
+            role => 'human',
+            host => '',
+            port => 0,
+        };
+        $c->{presence} = $st{$id};
+        $c->{seen} = iso_now();
+    }
+    note_digest();
+}
+
+sub bus_reply {
+    my ($agent, $id, $type, $payload) = @_;
+    pico_send($agent, control_sid($agent), {
+        type       => $type,
+        id         => $id,
+        session_id => control_sid($agent),
+        payload    => $payload,
+    });
+}
+
+sub poll_agent {
+    my ($agent) = @_;
+    my $base = "http://$agent->{host}:$agent->{port}";
+    my $card = $cards{$agent->{id}} ||= {
+        id       => $agent->{id},
+        host     => $agent->{host},
+        port     => 0 + $agent->{port},
+        nick     => undef,
+        role     => undef,
+        presence => 'down',
+    };
+    $card->{host} = $agent->{host};
+    $card->{port} = 0 + $agent->{port};
+    $ua->get("$base/health" => sub {
+        my ($ua, $tx) = @_;
+        my $res = $tx->result;
+        if ($res->is_success) {
+            my $j = eval { decode_json($res->body) } || {};
+            $card->{health}   = $j->{status} // 'ok';
+            $card->{pid}      = $j->{pid} if defined $j->{pid};
+            $card->{presence} = 'up';
+        }
+        else {
+            $card->{health}   = 'down';
+            $card->{presence} = 'down';
+        }
+        $card->{seen} = iso_now();
+        $ua->get("$base/ready" => sub {
+            my ($ua, $tx) = @_;
+            my $res = $tx->result;
+            if ($res->is_success) {
+                my $j = eval { decode_json($res->body) } || {};
+                $card->{ready} = $j->{status} // 'ready';
+            }
+            else {
+                $card->{ready} = 'unknown';
+            }
+            $ua->get("$base/beacon" => sub {
+                my ($ua, $tx) = @_;
+                my $res = $tx->result;
+                if ($res->is_success) {
+                    my $j = eval { decode_json($res->body) } || {};
+                    if (!defined $j->{id} || $j->{id} eq $agent->{id}) {
+                        $card->{nick} = $j->{nick} if defined $j->{nick} && $j->{nick} ne '';
+                        $card->{role} = $j->{role} if defined $j->{role} && $j->{role} ne '';
+                    }
+                }
+                elsif (($res->code // 0) == 404) {
+                    $card->{nick} = undef;
+                    $card->{role} = undef;
+                }
+                note_digest();
+            });
+        });
+    });
+}
+
+sub endpoint_up {
+    my ($id) = @_;
+    refresh_hub_peers() unless is_our_berth($id);
+    my $c = $cards{$id} or return 0;
+    return 0 unless ($c->{presence} // '') eq 'up';
+    if (is_our_berth($id)) {
+        return ($c->{health} // '') eq 'ok';
+    }
+    return 1;
+}
+
 sub sid_for {
     my ($from) = @_;
     $from = 'anon' unless defined $from && $from ne '';
@@ -124,6 +354,30 @@ sub handle_pico {
     return unless $msg && ref $msg eq 'HASH';
     my $type = $msg->{type} // '';
     my $sid  = $msg->{session_id} // '';
+    if ($type eq 'bus.send') {
+        my $pl      = $msg->{payload} || {};
+        my $to      = $pl->{to} // '';
+        my $content = $pl->{content} // '';
+        my $mid     = $msg->{id} // '';
+        if ($to eq '' || $to eq $agent->{id} || !length $content) {
+            bus_reply($agent, $mid, 'bus.error', { to => $to, error => 'bad request' });
+            return;
+        }
+        unless (endpoint_up($to)) {
+            bus_reply($agent, $mid, 'bus.error', { to => $to, error => 'unreachable' });
+            logmsg("$agent->{id} bus.send to=$to unreachable");
+            return;
+        }
+        hub_write($agent, {
+            type    => 'message',
+            from    => $agent->{id},
+            to      => $to,
+            content => $content,
+        });
+        bus_reply($agent, $mid, 'bus.ack', { to => $to });
+        logmsg("$agent->{id} bus.send to=$to bytes=" . length($content));
+        return;
+    }
     if ($type eq 'error') {
         my $pl = $msg->{payload} || {};
         logmsg("$agent->{id} pico error: " . ($pl->{message} // $pl->{code} // '?'));
@@ -238,6 +492,9 @@ sub connect_ws {
             }
             $agent->{ws}{$sid} = $tx;
             logmsg("$agent->{id} pico ws up sid=$sid");
+            if ($sid eq control_sid($agent)) {
+                send_directory_frame($agent);
+            }
             while (my $hash = shift @{ $agent->{q}{$sid} || [] }) {
                 $tx->send({ json => $hash });
             }
@@ -264,10 +521,18 @@ sub connect_ws {
     );
 }
 
+load_directory();
+
 for my $a (@agents) {
     connect_hub($a);
-    connect_ws($a, 'pb.' . $a->{id});
+    connect_ws($a, control_sid($a));
+    poll_agent($a);
 }
+
+Mojo::IOLoop->recurring($POLL => sub {
+    poll_agent($_) for @agents;
+    refresh_hub_peers();
+});
 
 logmsg("watching " . join(',', map { $_->{id} } @agents));
 Mojo::IOLoop->start;

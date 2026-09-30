@@ -68,12 +68,18 @@ for (1 .. 40) {
 }
 ok($up, 'hub listening');
 
+my $statedir = "$dir/fake";
+mkdir $statedir, 0700 or die $!;
+open my $pf, '>', "$statedir/probe.json" or die $!;
+print $pf encode_json({ id => 'lab', nick => 'bench', role => 'bench', pid => 1 });
+close $pf;
+
 my $ws_pid = fork();
 die "fork ws: $!" unless defined $ws_pid;
 if ($ws_pid == 0) {
     open STDOUT, '>', "$dir/ws.out";
     open STDERR, '>&STDOUT';
-    exec $^X, "$FindBin::Bin/fake-pico-ws.pl", $port, $token or exit 127;
+    exec $^X, "$FindBin::Bin/fake-pico-ws.pl", $port, $token, 'lab', $statedir or exit 127;
 }
 
 my $ws_up;
@@ -89,6 +95,8 @@ ok($ws_up, 'fake pico listening');
 $ENV{PICO_AGENTS}     = "lab=127.0.0.1:$port";
 $ENV{PICO_TOKEN_DIR}  = $tokd;
 $ENV{PICO_IDLE_FLUSH} = 2;
+$ENV{PICO_DIRECTORY}  = "$dir/directory.json";
+$ENV{PICO_POLL}       = 1;
 
 my $br_pid = fork();
 die "fork bridge: $!" unless defined $br_pid;
@@ -145,7 +153,106 @@ if ($up && $ws_up && $reg) {
     close $c;
 }
 ok($got, 'hub message round-trips through Pico WS');
-if (!$got) {
+
+sub read_text {
+    my ($path) = @_;
+    return '' unless -f $path;
+    open my $fh, '<', $path or return '';
+    local $/;
+    my $raw = <$fh> // '';
+    close $fh;
+    return $raw;
+}
+
+my $dir_ok;
+my $nick_ok;
+for (1 .. 30) {
+    my $raw = read_text("$dir/directory.json");
+    if ($raw =~ /"nick":"bench"/ && $raw =~ /"id":"lab"/) {
+        $dir_ok = 1;
+        $nick_ok = 1;
+        last;
+    }
+    select undef, undef, undef, 0.2;
+}
+ok($dir_ok && $nick_ok, 'directory learns nick from /beacon');
+
+sub directory_frames {
+    return () = read_text("$statedir/frames.ndjson") =~ /"type":"directory"/g;
+}
+
+my $frames_before = 0;
+my $same = 0;
+for (1 .. 40) {
+    my $n = directory_frames();
+    if ($n > 0 && $n == $frames_before) {
+        $same++;
+        last if $same >= 3;
+    }
+    else {
+        $same = 0;
+        $frames_before = $n;
+    }
+    select undef, undef, undef, 0.4;
+}
+ok($frames_before > 0, 'directory frame stored, not a message.send');
+
+open my $pf2, '>', "$statedir/probe.json" or die $!;
+print $pf2 encode_json({ id => 'lab', nick => 'bench', role => 'bench', pid => 99 });
+close $pf2;
+my $pid_ok;
+for (1 .. 30) {
+    my $raw = read_text("$dir/directory.json");
+    if ($raw =~ /"pid":99/) { $pid_ok = 1; last }
+    select undef, undef, undef, 0.2;
+}
+my $frames_after = directory_frames();
+ok($pid_ok, 'directory pid updates from /health');
+ok($frames_after == $frames_before, 'pid change does not push a directory frame');
+
+sub http_post_json {
+    my ($peerport, $path, $obj) = @_;
+    my $body = encode_json($obj);
+    my $s = IO::Socket::INET->new(
+        PeerAddr => '127.0.0.1', PeerPort => $peerport, Proto => 'tcp',
+    ) or return 0;
+    print $s "POST $path HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\nContent-Length: "
+        . length($body) . "\r\nConnection: close\r\n\r\n" . $body;
+    local $/;
+    my $resp = <$s> // '';
+    close $s;
+    return $resp =~ m{\AHTTP/\S+\s+200};
+}
+
+my $todd_got;
+if ($up) {
+    my $todd = connect_hub();
+    print $todd encode_json({ type => 'register', id => 'todd' }), "\n";
+    $todd->flush;
+    select undef, undef, undef, 0.4;
+    my $posted = http_post_json($port, '/emit', { to => 'todd', content => 'hello-todd' });
+    ok($posted, 'asked fake pico to emit bus.send');
+    eval {
+        local $SIG{ALRM} = sub { die "timeout\n" };
+        alarm 5;
+        while (my $line = <$todd>) {
+            my $o = eval { decode_json($line) } or next;
+            next unless ($o->{type} // '') eq 'message';
+            if (($o->{from} // '') eq 'lab' && ($o->{content} // '') eq 'hello-todd') {
+                $todd_got = 1;
+                last;
+            }
+        }
+        alarm 0;
+    };
+    alarm 0;
+    close $todd;
+}
+ok($todd_got, 'bus.send reaches a non-berth hub client');
+my $ack = read_text("$statedir/frames.ndjson");
+ok($ack =~ /"type":"bus\.ack"/, 'bus.ack returned on the control socket');
+
+if (!$got || !$dir_ok || !$pid_ok || !$todd_got) {
     for my $f (qw(pico.out ws.out hub.out hub.ndjson)) {
         next unless -f "$dir/$f";
         print "--- $f ---\n";

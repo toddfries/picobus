@@ -43,6 +43,16 @@ rcctl enable picobus picobus_pico
 rcctl start picobus picobus_pico
 ```
 
+`picobus-pico` polls `GET /health`, `GET /ready`, and `GET /beacon`
+(no model turn) and writes `/var/picobus/dir/directory.json`. That
+directory is `0750 _picobus:picobus` because `/var/picobus` itself is
+not writable by the daemon (secrets live next to it). A `directory`
+frame is pushed on the control socket `pb.<id>` only when id, nick, or
+role changes. Pid and uptime changes do not push. A gateway `bus.send`
+frame on that socket is one hub unicast. `bus.ack` or `bus.error`
+comes back on the same socket. Nick stays empty until `/beacon` returns
+it. Missing beacon is 404, not a guessed name.
+
 Token files are `$PICO_TOKEN_DIR/<id>` (one line, mode 0640). Put the
 same value under `channel_list.pico.settings.token` in that instance's
 `.security.yml` — never append YAML at EOF. Handshake `?session_id=`

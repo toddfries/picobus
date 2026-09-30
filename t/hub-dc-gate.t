@@ -214,6 +214,35 @@ if ($up) {
     ok($page->{body} =~ m{/api/v1/dc/state}, 'page polls /api/v1/dc/state');
     ok($page->{body} =~ /compose-hint/, 'composer explains #system');
     ok($page->{body} !~ /altcha|llm_key/i, 'allowlisted page is not the setup form');
+    ok($page->{body} =~ m{/dc/chrome\.js}, 'page loads its own chrome script');
+    ok($page->{body} =~ m{/dc/chrome\.css}, 'page loads its own chrome css');
+    ok($page->{body} =~ /ZHCTHEME_/, 'page boots the site theme cookie');
+    ok($page->{body} !~ m{/shared/zhc-prefs}, 'page does not reach around for site chrome');
+    ok($anon->{body} !~ m{zhc-services-menu|/dc/chrome}, 'status page has no chrome');
+
+    my $js = fcgi_do('GET', '/dc/chrome.js', '', cookie => $fdh);
+    ok($js->{status} eq '200', 'chrome script is 200')
+        or print "# chrome status=$js->{status}\n";
+    ok(scalar($js->{body} =~ /ZHCTHEME_/), 'chrome script uses the site theme cookie');
+    ok(scalar($js->{body} =~ m{/dc/icons/}) && scalar($js->{body} =~ /menu\.svg/), 'chrome script pulls the menu icon');
+    ok(scalar($js->{head} =~ m{text/javascript}i), 'chrome script content type');
+    my $css = fcgi_do('GET', '/dc/chrome.css', '', cookie => $fdh);
+    ok($css->{status} eq '200' && scalar($css->{body} =~ /zhc-cookie-tray/), 'chrome css has the tray');
+    my $ico = fcgi_do('GET', '/dc/icons/menu.svg', '', cookie => $fdh);
+    ok($ico->{status} eq '200' && scalar($ico->{body} =~ /<svg\b/), 'menu icon is svg');
+    ok(scalar($ico->{head} =~ m{image/svg\+xml}i), 'menu icon content type');
+    for my $name (qw(theme-light.svg theme-dark.svg theme-system.svg cookie.svg terms.svg privacy.svg)) {
+        my $one = fcgi_do('GET', "/dc/icons/$name", '', cookie => $fdh);
+        ok($one->{status} eq '200' && scalar($one->{body} =~ /<svg\b/), "icon $name");
+    }
+    my $trav = fcgi_do('GET', '/dc/icons/../chrome.js', '', cookie => $fdh);
+    ok($trav->{status} eq '404', 'icon traversal is 404');
+    my $badico = fcgi_do('GET', '/dc/icons/menu.svg.txt', '', cookie => $fdh);
+    ok($badico->{status} eq '404', 'odd icon name is 404');
+    my $nojs = fcgi_do('GET', '/dc/chrome.js');
+    ok($nojs->{status} eq '401', 'unsigned chrome script is 401');
+    my $frjs = fcgi_do('GET', '/dc/chrome.js', '', cookie => $fries);
+    ok($frjs->{status} eq '403', 'other account chrome script is 403');
 
     my $root = fcgi_do('GET', '/', '', cookie => $fdh);
     ok($root->{status} eq '404', 'gate does not serve /');

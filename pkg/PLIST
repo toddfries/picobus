@@ -9,6 +9,15 @@ share/picobus/shared/altcha-widget-v1.min.js
 share/picobus/shared/crew-prefs.js
 share/picobus/shared/altcha-http-shim.js
 share/picobus/shared/zhc-prefs.css
+share/picobus/dc/chrome.css
+share/picobus/dc/chrome.js
+share/picobus/dc/icons/menu.svg
+share/picobus/dc/icons/theme-light.svg
+share/picobus/dc/icons/theme-dark.svg
+share/picobus/dc/icons/theme-system.svg
+share/picobus/dc/icons/cookie.svg
+share/picobus/dc/icons/terms.svg
+share/picobus/dc/icons/privacy.svg
 share/examples/picobus/picobus.conf
 @sample ${SYSCONFDIR}/picobus.conf
 share/examples/picobus/httpd.conf

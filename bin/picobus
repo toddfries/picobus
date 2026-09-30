@@ -109,6 +109,11 @@ sub hub_sandbox {
         $dir{$p} = 'r';
         my $sh = "$p/shared";
         $dir{$sh} = 'r' if -d $sh;
+        # Unveil is not recursive. Chrome icons live one directory down.
+        my $dc = "$p/dc";
+        $dir{$dc} = 'r' if -d $dc;
+        my $icons = "$dc/icons";
+        $dir{$icons} = 'r' if -d $icons;
     }
     if ($PICO_HOME) {
         mkdir $PICO_HOME, 0700 unless -d $PICO_HOME;
@@ -145,6 +150,11 @@ $SECRETS_DIR //= (_parent_dir($HUB_LOG) || '.') . '/secrets';
 if (!defined $SHARE_DIR || $SHARE_DIR eq '') {
     my $dev = "$FindBin::Bin/../share";
     $SHARE_DIR = (-d $dev) ? $dev : '/usr/local/share/picobus';
+}
+if (defined $SHARE_DIR && $SHARE_DIR =~ m{\.\.}) {
+    require Cwd;
+    my $abs = Cwd::abs_path($SHARE_DIR);
+    $SHARE_DIR = $abs if defined $abs && $abs =~ m{\A/};
 }
 {
     my $state = _parent_dir($HUB_LOG);
@@ -449,6 +459,53 @@ sub share_file {
         return $p if -f $p;
     }
     return;
+}
+
+# /dc/chrome.js, /dc/chrome.css, /dc/icons/<name>.svg. No dot segments.
+sub dc_asset_rel {
+    my ($path) = @_;
+    return unless defined $path;
+    return $1 if $path =~ m{\A/dc/(chrome\.js|chrome\.css|icons/[a-z0-9]+(?:-[a-z0-9]+)*\.svg)\z};
+    return;
+}
+
+sub dc_asset_file {
+    my ($rel) = @_;
+    return unless defined $rel && $rel !~ m{\.\.};
+    for my $root ($SHARE_DIR, '/usr/local/share/picobus') {
+        next unless defined $root && length $root;
+        my $p = "$root/dc/$rel";
+        my @st = lstat($p);
+        next unless @st;
+        next if -l _;
+        next unless -f _;
+        next if ($st[7] // 0) <= 0 || $st[7] > 262144;
+        return $p;
+    }
+    return;
+}
+
+sub serve_dc_asset {
+    my ($path) = @_;
+    my $rel = dc_asset_rel($path);
+    return 0 unless defined $rel;
+    my $file = dc_asset_file($rel);
+    my $s = '';
+    my $n = 0;
+    if ($file && open my $fh, '<:raw', $file) {
+        $n = read($fh, $s, 262144);
+        close $fh;
+    }
+    if (!$n) {
+        fcgi_print('text/plain; charset=utf-8', "not found\n", '404 Not Found');
+        return 1;
+    }
+    my $ct = 'application/octet-stream';
+    $ct = 'text/css; charset=utf-8' if $rel =~ /\.css\z/;
+    $ct = 'text/javascript; charset=utf-8' if $rel =~ /\.js\z/;
+    $ct = 'image/svg+xml' if $rel =~ /\.svg\z/;
+    fcgi_print($ct, $s);
+    return 1;
 }
 
 sub write_llm_secrets {
@@ -1033,11 +1090,17 @@ sub zhc_authorize {
     return $decision;
 }
 
-# Page at /dc. API at /api/v1/dc/{state,history,send,files}. Nothing else.
+# Page at /dc. Chrome and icons under /dc/. API at /api/v1/dc/{state,history,send,files}.
 sub zhc_public_path {
     my ($path) = @_;
     $path = '/' unless defined $path && length $path;
     return '/' if $path eq '/dc' || $path eq '/dc/' || $path eq '/dc/index.html';
+    if ($path =~ m{\A/dc/(chrome\.js|chrome\.css)\z}) {
+        return '/dc/' . $1;
+    }
+    if ($path =~ m{\A/dc/icons/([a-z0-9]+(?:-[a-z0-9]+)*\.svg)\z}) {
+        return '/dc/icons/' . $1;
+    }
     if ($path =~ m{\A/api/v1/dc/(state|history|send)/?\z}i) {
         return '/api/' . lc($1);
     }
@@ -1119,6 +1182,14 @@ sub handle_fcgi {
             json_out(404, { ok => \0, error => 'not found' });
             return;
         }
+    }
+    if (defined dc_asset_rel($path)) {
+        if ($method ne 'GET' && $method ne 'HEAD') {
+            fcgi_print('text/plain; charset=utf-8', "method not allowed\n", '405 Method Not Allowed');
+            return;
+        }
+        serve_dc_asset($path);
+        return;
     }
     my $is_upload = ($path =~ m{/api/files/?$}i && $method eq 'POST');
     my $max_body  = $is_upload ? $MAX_UPLOAD : 65536;
@@ -1548,9 +1619,21 @@ sub app_html {
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<meta name="color-scheme" content="dark">
-<meta name="picobus-cookie" content="__COOKIE__">
 <title>__PRODUCT__</title>
+<script>
+(function () {
+  var b = location.pathname.match(/^\/(dev|qa)(\/|$)/);
+  var k = 'ZHCTHEME_' + (b ? b[1].toUpperCase() : 'PROD');
+  var m = document.cookie.match(new RegExp('(?:^|; )' + k + '=([^;]*)'));
+  var v = m ? decodeURIComponent(m[1]) : 'system';
+  if (v !== 'light' && v !== 'dark' && v !== 'system') v = 'system';
+  var dark = v === 'dark' || (v === 'system' && matchMedia('(prefers-color-scheme: dark)').matches);
+  document.documentElement.setAttribute('data-zhc-theme', dark ? 'dark' : 'light');
+  document.documentElement.setAttribute('data-zhc-theme-pref', v);
+})();
+</script>
+<link rel="stylesheet" href="/dc/chrome.css">
+<script src="/dc/chrome.js" defer></script>
 <style>
 :root {
   --bg:#313338; --side:#2b2d31; --compose:#383a40; --hover:#35373c;
@@ -1558,13 +1641,15 @@ sub app_html {
   --sys:#6d6f78; --line:#3f4147; --blurple:#5865f2; --green:#23a559;
   --yellow:#f0b232; --red:#f23f43; --off:#80848e; --me:#00a8fc;
 }
+html[data-zhc-theme="dark"] { color-scheme: dark; }
+html[data-zhc-theme="light"] { color-scheme: light; }
 * { box-sizing:border-box; }
 html,body { height:100%; margin:0; }
 body {
   background:var(--bg); color:var(--text);
   font:15px/1.375 system-ui,"Segoe UI",sans-serif;
 }
-.app { display:flex; height:100%; }
+.app { display:flex; height:100%; padding:3.15rem 0 3.25rem; }
 .sidebar {
   width:240px; background:var(--side); display:flex;
   flex-direction:column; flex-shrink:0;
@@ -1714,6 +1799,23 @@ textarea:disabled { opacity:.55; }
 .transcript::-webkit-scrollbar-thumb,#channels::-webkit-scrollbar-thumb {
   background:#1a1b1e; border-radius:4px;
 }
+html[data-zhc-theme="light"] {
+  --bg:#f2f3f5; --side:#e3e5e8; --compose:#ffffff; --hover:#d7d9de;
+  --sel:#e0e1e5; --text:#2e3035; --head:#060607; --muted:#5c5e66;
+  --sys:#6d6f78; --line:#e1e2e4; --yellow:#9a6b00; --red:#da373c;
+  --off:#6d7078; --me:#0068c9;
+}
+html[data-zhc-theme="light"] .brand,
+html[data-zhc-theme="light"] .side-foot { border-color:#d4d6db; }
+html[data-zhc-theme="light"] .menu,
+html[data-zhc-theme="light"] .props {
+  background:#fff; border-color:var(--line); color:var(--text);
+}
+html[data-zhc-theme="light"] .msg .body code,
+html[data-zhc-theme="light"] .filechip { background:#e3e5e8; }
+html[data-zhc-theme="light"] .filechip a.name { color:#0b57d0; }
+html[data-zhc-theme="light"] .transcript::-webkit-scrollbar-thumb,
+html[data-zhc-theme="light"] #channels::-webkit-scrollbar-thumb { background:#c4c6cc; }
 </style>
 </head>
 <body>

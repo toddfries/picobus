@@ -79,6 +79,12 @@ With `PICOBUS_ZHC_GATE=1`, a refused `/dc` page is only a status:
 Sign in required, Forbidden, or Unavailable. The plain look is enough
 for now. A later cut may style it. Do not replace it with the crew UI.
 
+The signed-in page copies the site menu, the light/dark/system control,
+and the cookie tray. Those files live in `share/dc/` and are served from
+`/dc/chrome.js`, `/dc/chrome.css`, and `/dc/icons/`. The theme cookie is
+`ZHCTHEME_*`, the same one the rest of the site writes. Do not point the
+page at `/shared/zhc-prefs.js`.
+
 Signup (`/api/setup`, ALTCHA, account page) writes the LLM key into
 `$PICOCLAW_HOME/.security.yml`. The model alias defaults to `default`;
 set `PICOBUS_LLM_ALIAS` to use another name.

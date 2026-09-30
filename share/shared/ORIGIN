@@ -7,7 +7,12 @@ zhc-prefs.css
   the picobus-cookie meta tag (default PICOBUS).
 
 crew-prefs.js
-  Theme toggle + cookie tray. Cookie {PREFIX}_THEME_{PROD|DEV|QA}. No phone-home.
+  Theme toggle + cookie tray for the signup page. Cookie {PREFIX}_THEME_{PROD|DEV|QA}.
+
+dc/chrome.js, dc/chrome.css, dc/icons/
+  Copy of the site menu, appearance control, and cookie tray for /dc/.
+  Theme cookie is ZHCTHEME_*, same as zhc.fdh.bz. Icons are served by picobus.
+  Not loaded from /shared/.
 
 altcha-http-shim.js
   crypto.subtle SHA-256 polyfill + disable Workers on plain HTTP so the

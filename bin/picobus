@@ -63,6 +63,8 @@ my $ZHC_EMAIL    = $ENV{PICOBUS_ZHC_EMAIL} // 'todd@fdh.bz';
 my $ZHC_COOKIE   = $ENV{PICOBUS_ZHC_COOKIE} // 'ZHCSESS_PROD';
 my $ZHC_SESS_DIR = $ENV{PICOBUS_ZHC_SESSION_DIR} // '/var/www/tmp/php-sessions-zhc-prod';
 my $ZHC_DB       = $ENV{PICOBUS_ZHC_DB} // '/var/www/data/escalate.sqlite';
+# Set from the request path before a gated page or API is rendered.
+my $ZHC_REQ_BUCKET = 'prod';
 # -----------------------------------------
 
 umask $UMASK;
@@ -131,6 +133,13 @@ sub hub_sandbox {
             $dir{$ZHC_SESS_DIR} = 'r';
         } else {
             die "ZHC session dir unavailable\n";
+        }
+        # Dev and qa are optional at startup. Prod keeps running if those
+        # directories are not there yet. A request for a missing one is 401.
+        for my $b (qw(dev qa)) {
+            my $d = zhc_sess_dir_for($b);
+            next unless defined $d && $d =~ m{\A/} && $d !~ m{\.\.} && -d $d;
+            $dir{$d} = 'r';
         }
         if ($ZHC_DB =~ m{\A/} && $ZHC_DB !~ m{\.\.} && -f $ZHC_DB) {
             my $parent = _parent_dir($ZHC_DB);
@@ -930,7 +939,7 @@ sub save_upload {
         name  => $name,
         bytes => length($bytes),
         mime  => $mime,
-        url   => (zhc_gate() ? '/api/v1/dc/files/' : '/api/files/') . $id,
+        url   => (zhc_gate() ? zhc_req_prefix() . '/api/v1/dc/files/' : '/api/files/') . $id,
     };
     if (open my $mf, '>', file_meta_path($id)) {
         print $mf encode_json($meta);
@@ -994,10 +1003,12 @@ sub zhc_ct_eq {
     return $d == 0;
 }
 
-# Every ZHCSESS_PROD value, plus a flag when one of them is malformed.
-# Last-match would treat a leftover allowlisted cookie as the sign-in.
+# Every value of this bucket's session cookie, plus a flag when one is malformed.
+# Last-match would treat a leftover admin cookie as the sign-in.
 sub zhc_cookie_sids {
-    return ([], 1) if !defined $ZHC_COOKIE || $ZHC_COOKIE !~ /^[A-Za-z0-9_]{1,64}\z/;
+    my ($cookie) = @_;
+    $cookie = $ZHC_COOKIE unless defined $cookie;
+    return ([], 1) if !defined $cookie || $cookie !~ /^[A-Za-z0-9_]{1,64}\z/;
     my $raw = $ENV{HTTP_COOKIE} // '';
     my @sids;
     my $bad = 0;
@@ -1006,7 +1017,7 @@ sub zhc_cookie_sids {
         next unless defined $k && defined $v;
         $k =~ s/^\s+|\s+$//g;
         $v =~ s/^\s+|\s+$//g;
-        next unless $k eq $ZHC_COOKIE;
+        next unless $k eq $cookie;
         if ($v =~ /\A[A-Za-z0-9,-]{16,128}\z/) {
             push @sids, $v unless grep { $_ eq $v } @sids;
         } else {
@@ -1073,10 +1084,11 @@ sub zhc_php_take {
 
 # PHP session file. () on any failure. user_id is a product profile, not the account.
 sub zhc_session_claims {
-    my ($sid) = @_;
+    my ($sid, $sess_dir) = @_;
+    $sess_dir = $ZHC_SESS_DIR unless defined $sess_dir;
     return if !defined $sid || $sid !~ /\A[A-Za-z0-9,-]{16,128}\z/;
-    return if $ZHC_SESS_DIR !~ m{\A/} || $ZHC_SESS_DIR =~ m{\.\.};
-    my $path = $ZHC_SESS_DIR . '/sess_' . $sid;
+    return if $sess_dir !~ m{\A/} || $sess_dir =~ m{\.\.};
+    my $path = $sess_dir . '/sess_' . $sid;
     my @st = lstat($path);
     return unless @st;
     return if -l _;
@@ -1148,11 +1160,27 @@ sub zhc_user_row {
     return $row ? ('ok', $row) : ('miss');
 }
 
+# admin is the only role this cut grants. The configured address is compared
+# here and nowhere else. A later instance changes the address, not the checks.
+sub zhc_roles_for_row {
+    my ($row) = @_;
+    return () unless $row && ref($row) eq 'HASH';
+    my $verified = ($row->{email_verified} // 0) + 0;
+    return () if $verified != 1;
+    my $allow = lc($ZHC_EMAIL // '');
+    $allow =~ s/^\s+|\s+$//g;
+    return () if $allow eq '' || $allow !~ /\A[^\s@]+@[^\s@]+\z/;
+    my $email = lc($row->{email} // '');
+    $email =~ s/^\s+|\s+$//g;
+    return () unless zhc_ct_eq(sha256_hex($email), sha256_hex($allow));
+    return ('admin');
+}
+
 sub zhc_authorize_sid {
-    my ($sid) = @_;
-    my ($uid, $sess_email) = zhc_session_claims($sid);
+    my ($sid, $sess_dir) = @_;
+    my ($uid, $sess_email) = zhc_session_claims($sid, $sess_dir);
     return { ok => 0, code => 401, error => 'sign in required' } unless $uid;
-    my $allow = lc $ZHC_EMAIL;
+    my $allow = lc($ZHC_EMAIL // '');
     $allow =~ s/^\s+|\s+$//g;
     if ($allow eq '' || $allow !~ /\A[^\s@]+@[^\s@]+\z/) {
         return { ok => 0, code => 503, error => 'unavailable' };
@@ -1160,31 +1188,87 @@ sub zhc_authorize_sid {
     my ($st, $row) = zhc_user_row($uid);
     return { ok => 0, code => 503, error => 'unavailable' } if $st eq 'err';
     return { ok => 0, code => 403, error => 'forbidden' } if $st ne 'ok';
-    my $verified = ($row->{email_verified} // 0) + 0;
-    return { ok => 0, code => 403, error => 'forbidden' } if $verified != 1;
-    my $email = lc($row->{email} // '');
-    $email =~ s/^\s+|\s+$//g;
-    return { ok => 0, code => 403, error => 'forbidden' }
-        unless zhc_ct_eq(sha256_hex($email), sha256_hex($allow));
-    # A copied email that is not the allowlisted account is a second sign-in.
+    my $admin = grep { $_ eq 'admin' } zhc_roles_for_row($row);
+    return { ok => 0, code => 403, error => 'forbidden' } unless $admin;
+    # A copied email must be this row's email, not a second copy of the grant.
     if (defined $sess_email) {
         my $se = lc $sess_email;
         $se =~ s/^\s+|\s+$//g;
+        my $row_email = lc($row->{email} // '');
+        $row_email =~ s/^\s+|\s+$//g;
         return { ok => 0, code => 403, error => 'forbidden' }
-            unless zhc_ct_eq(sha256_hex($se), sha256_hex($allow));
+            unless zhc_ct_eq(sha256_hex($se), sha256_hex($row_email));
     }
     return { ok => 1, code => 200 };
 }
 
 sub zhc_authorize {
-    my ($sids, $bad) = zhc_cookie_sids();
+    my ($path) = @_;
+    my $bucket = zhc_bucket_of(defined $path ? $path : '/');
+    my $cookie = zhc_cookie_for($bucket);
+    my $sess_dir = zhc_sess_dir_for($bucket);
+    if (!defined $cookie || !defined $sess_dir
+        || $sess_dir !~ m{\A/} || $sess_dir =~ m{\.\.} || !-d $sess_dir) {
+        return { ok => 0, code => 401, error => 'sign in required' };
+    }
+    my ($sids, $bad) = zhc_cookie_sids($cookie);
     return { ok => 0, code => 401, error => 'sign in required' } if $bad || !@$sids;
     my $decision;
     for my $sid (@$sids) {
-        $decision = zhc_authorize_sid($sid);
+        $decision = zhc_authorize_sid($sid, $sess_dir);
         return $decision if !$decision->{ok};
     }
     return $decision;
+}
+
+# /dev and /qa are doors. The configured names are the prod pair; swap the suffix.
+sub zhc_bucket_of {
+    my ($path) = @_;
+    $path = '/' unless defined $path && length $path;
+    return 'dev' if $path eq '/dev' || $path =~ m{\A/dev/};
+    return 'qa'  if $path eq '/qa'  || $path =~ m{\A/qa/};
+    return 'prod';
+}
+
+sub zhc_prefix_for {
+    my ($bucket) = @_;
+    return '/dev' if ($bucket // '') eq 'dev';
+    return '/qa'  if ($bucket // '') eq 'qa';
+    return '';
+}
+
+sub zhc_req_prefix {
+    return '' unless $ZHC_GATE;
+    return zhc_prefix_for($ZHC_REQ_BUCKET);
+}
+
+sub zhc_cookie_for {
+    my ($bucket) = @_;
+    return $ZHC_COOKIE if !defined $bucket || $bucket eq 'prod';
+    return undef unless defined $ZHC_COOKIE && $ZHC_COOKIE =~ /_PROD\z/;
+    my $suf = $bucket eq 'dev' ? '_DEV' : $bucket eq 'qa' ? '_QA' : undef;
+    return undef unless defined $suf;
+    (my $name = $ZHC_COOKIE) =~ s/_PROD\z/$suf/;
+    return $name;
+}
+
+sub zhc_sess_dir_for {
+    my ($bucket) = @_;
+    return $ZHC_SESS_DIR if !defined $bucket || $bucket eq 'prod';
+    return undef unless defined $ZHC_SESS_DIR && $ZHC_SESS_DIR =~ /-prod\z/;
+    my $suf = $bucket eq 'dev' ? '-dev' : $bucket eq 'qa' ? '-qa' : undef;
+    return undef unless defined $suf;
+    (my $dir = $ZHC_SESS_DIR) =~ s/-prod\z/$suf/;
+    return $dir;
+}
+
+# One leading bucket only. /developer and /quality stay untouched.
+sub zhc_strip_bucket {
+    my ($path) = @_;
+    $path = '/' unless defined $path && length $path;
+    return $path unless $path =~ m{\A/(?:dev|qa)(?=/|\z)};
+    $path =~ s{\A/(?:dev|qa)}{};
+    return $path eq '' ? '/' : $path;
 }
 
 # Page at /dc. Chrome and icons under /dc/. API at /api/v1/dc/{state,history,send,files}.
@@ -1222,8 +1306,9 @@ sub zhc_deny {
     }
     my $title = $code == 401 ? 'Sign in required'
         : $code == 403 ? 'Forbidden' : 'Unavailable';
+    my $acct = zhc_req_prefix() . '/account/';
     my $extra = $code == 401
-        ? "<p>Sign in required.</p>\n<p><a href=\"/account/\">Sign in</a></p>\n"
+        ? "<p>Sign in required.</p>\n<p><a href=\"$acct\">Sign in</a></p>\n"
         : "<p>$title.</p>\n";
     my $status = $code == 401 ? '401 Unauthorized'
         : $code == 403 ? '403 Forbidden' : '503 Service Unavailable';
@@ -1262,12 +1347,13 @@ sub handle_fcgi {
     my $clen   = $ENV{CONTENT_LENGTH} // 0;
     my $q = parse_urlencoded($ENV{QUERY_STRING} // '');
     if (zhc_gate()) {
-        my $decision = zhc_authorize();
+        $ZHC_REQ_BUCKET = zhc_bucket_of($path);
+        my $decision = zhc_authorize($path);
         if (!$decision->{ok}) {
             zhc_deny($decision, $path);
             return;
         }
-        my $mapped = zhc_public_path($path);
+        my $mapped = zhc_public_path(zhc_strip_bucket($path));
         if (!defined $mapped) {
             zhc_not_ours($path);
             return;
@@ -1572,7 +1658,7 @@ sub handle_fcgi {
         }
         inject_human_message($q->{to}, $q->{content});
         if (!$want_json && $method eq 'POST') {
-            my $loc = zhc_gate() ? '/dc/' : '/';
+            my $loc = zhc_gate() ? zhc_req_prefix() . '/dc/' : '/';
             cgi_out("Status: 303 See Other\r\nLocation: $loc\r\nCache-Control: no-store\r\n\r\n");
             return;
         }
@@ -1620,12 +1706,15 @@ sub apply_brand {
     my $cookie = $COOKIE_PREFIX;
     $cookie =~ s/[^A-Za-z0-9_]//g;
     $cookie = 'PICOBUS' unless length $cookie;
-    my $api  = zhc_gate() ? '/api/v1/dc' : '/api';
-    my $page = zhc_gate() ? '/dc/' : '/';
+    my $pre  = $ZHC_GATE ? zhc_req_prefix() : '';
+    my $api  = $ZHC_GATE ? $pre . '/api/v1/dc' : '/api';
+    my $page = $ZHC_GATE ? $pre . '/dc/' : '/';
+    my $acct = $pre . '/account/';
     $html =~ s/__PRODUCT__/$name/g;
     $html =~ s/__COOKIE__/$cookie/g;
     $html =~ s/__API__/$api/g;
     $html =~ s/__PAGE__/$page/g;
+    $html =~ s/__ACCOUNT__/$acct/g;
     return $html;
 }
 
@@ -1729,8 +1818,8 @@ sub app_html {
   document.documentElement.setAttribute('data-zhc-theme-pref', v);
 })();
 </script>
-<link rel="stylesheet" href="/dc/chrome.css">
-<script src="/dc/chrome.js" defer></script>
+<link rel="stylesheet" href="__PAGE__chrome.css">
+<script src="__PAGE__chrome.js" defer></script>
 <style>
 :root {
   --bg:#313338; --side:#2b2d31; --compose:#383a40; --hover:#35373c;
@@ -2426,7 +2515,7 @@ html[data-zhc-theme="light"] #channels::-webkit-scrollbar-thumb { background:#c4
     if (pollTimer) { clearInterval(pollTimer); pollTimer = 0; }
     var title = code === 401 ? "Sign in required" : "Forbidden";
     var extra = code === 401
-      ? "<p>Sign in required.</p><p><a href=\"/account/\">Sign in</a></p>"
+      ? "<p>Sign in required.</p><p><a href=\"__ACCOUNT__\">Sign in</a></p>"
       : "<p>Forbidden.</p>";
     document.open();
     document.write("<!DOCTYPE html><html lang=\"en\"><head><meta charset=\"utf-8\"><title>"

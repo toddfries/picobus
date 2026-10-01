@@ -1,14 +1,14 @@
 /**
  * Picobus copy of the ZHC services menu, appearance control, and cookie tray.
  * Theme cookie is ZHCTHEME_{DEV|QA|PROD}, same as the rest of the site.
- * Icons come from /dc/icons/. This file does not load /shared/zhc-prefs.js.
+ * Icons come from <bucket>/dc/icons/. This file does not load /shared/zhc-prefs.js.
  */
 (function () {
   'use strict';
 
   var THEME_MAX_AGE = 365 * 24 * 60 * 60;
   var THEME_VALUES = { light: 1, dark: 1, system: 1 };
-  var ICON = '/dc/icons/';
+  var ICON = bucketPrefix() + '/dc/icons/';
   var openId = null;
 
   function pathBucket() {
@@ -183,13 +183,14 @@
       { href: pre + '/dns/', label: 'DNS Health', match: function (p) { return p.indexOf('/dns') >= 0; } },
       { href: pre + '/account/', label: 'Account', match: function (p) { return p.indexOf('/account') >= 0 || p.indexOf('/auth') >= 0; } }
     ];
-    if (bucket === 'prod') {
-      core.push({
-        href: '/dc/',
-        label: '/dc/',
-        match: function (p) { return p === '/dc' || p.indexOf('/dc/') === 0; }
-      });
-    }
+    core.push({
+      href: pre + '/dc/',
+      label: pre + '/dc/',
+      match: function (p) {
+        var base = pre + '/dc';
+        return p === base || p.indexOf(base + '/') === 0;
+      }
+    });
     core.push(
       { href: pre + '/support/', label: 'Support / APIs', match: function (p) { return p.indexOf('/support') >= 0; } },
       { href: pre + '/behaviorbucks/', label: 'Behavior Bucks', match: function (p) { return p.indexOf('/behaviorbucks') >= 0; } }

@@ -11,19 +11,24 @@ use JSON::PP qw(encode_json decode_json);
 use DBI;
 
 my ($pass, $fail) = (0, 0);
-sub ok {
+sub ok ($;$) {
     my ($cond, $name) = @_;
+    $name //= '';
     if ($cond) { $pass++; print "ok - $name\n" }
     else       { $fail++; print "NOT OK - $name\n" }
     return $cond ? 1 : 0;
 }
 
 my $dir   = tempdir(CLEANUP => 1);
-my $sdir  = "$dir/sessions";
+my $sprod = "$dir/sessions-prod";
+my $sdev  = "$dir/sessions-dev";
+my $sqa   = "$dir/sessions-qa";
 my $db    = "$dir/users.sqlite";
 my $hsock = "$dir/hub.sock";
 my $fsock = "$dir/fcgi.sock";
-mkdir $sdir, 0700 or die "mkdir: $!";
+for my $sd ($sprod, $sdev, $sqa) {
+    mkdir $sd, 0700 or die "mkdir $sd: $!";
+}
 
 my $dbh = DBI->connect("dbi:SQLite:dbname=$db", '', '', { RaiseError => 1, PrintError => 0 });
 $dbh->do('CREATE TABLE zhc_users (id INTEGER PRIMARY KEY, email TEXT, email_verified INTEGER)');
@@ -37,8 +42,9 @@ sub php_s {
     return 's:' . length($s) . ':"' . $s . '";';
 }
 sub write_sess {
-    my ($sid, $body) = @_;
-    open my $fh, '>', "$sdir/sess_$sid" or die $!;
+    my ($sid, $body, $base) = @_;
+    $base //= $sprod;
+    open my $fh, '>', "$base/sess_$sid" or die $!;
     print $fh $body;
     close $fh;
 }
@@ -61,6 +67,11 @@ write_sess('gggggggggggggggg',
     'display_name|' . php_s($bait) . 'zhc_user_id|i:2;');
 write_sess('hhhhhhhhhhhhhhhh',
     'zhc_user_id|i:1;zhc_new_tokens|a:1:{s:3:"api";s:3:"red";}');
+# Same ids, other doors. A prod cookie must not open them.
+write_sess('aaaaaaaaaaaaaaaa', 'zhc_user_id|i:1;', $sdev);
+write_sess('bbbbbbbbbbbbbbbb', 'zhc_user_id|i:2;', $sdev);
+write_sess('aaaaaaaaaaaaaaaa', 'zhc_user_id|i:1;', $sqa);
+write_sess('bbbbbbbbbbbbbbbb', 'zhc_user_id|i:2;', $sqa);
 
 $ENV{HUB_SOCK}                 = $hsock;
 $ENV{HUB_LOG}                  = "$dir/hub.ndjson";
@@ -75,7 +86,7 @@ $ENV{HUB_NOSANDBOX}            = 1;
 $ENV{PICOBUS_ZHC_GATE}         = 1;
 $ENV{PICOBUS_ZHC_EMAIL}        = 'todd@fdh.bz';
 $ENV{PICOBUS_ZHC_COOKIE}       = 'ZHCSESS_PROD';
-$ENV{PICOBUS_ZHC_SESSION_DIR}  = $sdir;
+$ENV{PICOBUS_ZHC_SESSION_DIR}  = $sprod;
 $ENV{PICOBUS_ZHC_DB}           = $db;
 delete $ENV{HUB_NOFCGI};
 delete $ENV{PICOBUS_FCGI_GROUP};
@@ -177,6 +188,8 @@ my $unv   = 'ZHCSESS_PROD=cccccccccccccccc';
 if ($up) {
     my $anon = fcgi_do('GET', '/dc/');
     ok($anon->{status} eq '401', 'unsigned /dc/ is 401');
+    ok($anon->{body} =~ m{href="/account/"}, 'prod sign-in link');
+    ok($anon->{body} !~ m{href="/dev/account/"}, 'prod sign-in is not the dev door');
     ok($anon->{body} =~ /Sign in required/, 'unsigned page says sign in');
     ok($anon->{body} !~ /zhc-ops|altcha|llm_key/i, 'unsigned page has no transcript or setup');
     ok($anon->{head} =~ /X-Frame-Options: DENY/i, 'unsigned page denies frames');
@@ -224,6 +237,7 @@ if ($up) {
     ok($js->{status} eq '200', 'chrome script is 200')
         or print "# chrome status=$js->{status}\n";
     ok(scalar($js->{body} =~ /ZHCTHEME_/), 'chrome script uses the site theme cookie');
+    ok(scalar($js->{body} =~ m{pre \+ '/dc/'}), 'catalog link follows the bucket');
     ok(scalar($js->{body} =~ m{/dc/icons/}) && scalar($js->{body} =~ /menu\.svg/), 'chrome script pulls the menu icon');
     ok(scalar($js->{head} =~ m{text/javascript}i), 'chrome script content type');
     my $css = fcgi_do('GET', '/dc/chrome.css', '', cookie => $fdh);
@@ -258,6 +272,48 @@ if ($up) {
     my $tokens = fcgi_do('GET', '/api/v1/dc/state', '', cookie => 'ZHCSESS_PROD=hhhhhhhhhhhhhhhh');
     ok($tokens->{status} eq '200', 'session with an array value still allows');
 
+    my $dev_admin = 'ZHCSESS_DEV=aaaaaaaaaaaaaaaa';
+    my $dev_other = 'ZHCSESS_DEV=bbbbbbbbbbbbbbbb';
+    my $qa_admin  = 'ZHCSESS_QA=aaaaaaaaaaaaaaaa';
+    my $qa_other  = 'ZHCSESS_QA=bbbbbbbbbbbbbbbb';
+
+    my $dev_anon = fcgi_do('GET', '/dev/dc/');
+    ok($dev_anon->{status} eq '401', 'unsigned /dev/dc/ is 401');
+    ok($dev_anon->{body} =~ m{href="/dev/account/"}, 'dev sign-in link');
+    my $dev_api = fcgi_do('GET', '/dev/api/v1/dc/state');
+    ok($dev_api->{status} eq '401', 'unsigned /dev/api/v1/dc/state is 401');
+    my $qa_anon = fcgi_do('GET', '/qa/dc/');
+    ok($qa_anon->{status} eq '401', 'unsigned /qa/dc/ is 401');
+    ok($qa_anon->{body} =~ m{href="/qa/account/"}, 'qa sign-in link');
+    my $qa_api = fcgi_do('GET', '/qa/api/v1/dc/state');
+    ok($qa_api->{status} eq '401', 'unsigned /qa/api/v1/dc/state is 401');
+
+    my $prod_on_dev = fcgi_do('GET', '/dev/dc/', '', cookie => $fdh);
+    ok($prod_on_dev->{status} eq '401', 'prod cookie does not open /dev/dc');
+    my $dev_on_prod = fcgi_do('GET', '/dc/', '', cookie => $dev_admin);
+    ok($dev_on_prod->{status} eq '401', 'dev cookie does not open /dc');
+    my $dev_forbid = fcgi_do('GET', '/dev/api/v1/dc/state', '', cookie => $dev_other);
+    ok($dev_forbid->{status} eq '403', 'other account on /dev/dc is 403');
+    my $qa_forbid = fcgi_do('GET', '/qa/dc/', '', cookie => $qa_other);
+    ok($qa_forbid->{status} eq '403', 'other account on /qa/dc is 403');
+
+    my $mixed_no = fcgi_do('GET', '/dev/dc/', '', cookie => "$fdh; $dev_other");
+    ok($mixed_no->{status} eq '403', 'dev door ignores a prod admin cookie beside a non-admin');
+    my $mixed_yes = fcgi_do('GET', '/dev/api/v1/dc/state', '', cookie => "$fries; $dev_admin");
+    ok($mixed_yes->{status} eq '200', 'dev door uses the dev admin cookie, not the prod one');
+
+    my $dev_page = fcgi_do('GET', '/dev/dc/', '', cookie => $dev_admin);
+    ok($dev_page->{status} eq '200', 'admin /dev/dc/ is 200');
+    ok($dev_page->{body} =~ m{/dev/api/v1/dc/state}, 'dev page polls the dev API');
+    ok($dev_page->{body} =~ m{/dev/dc/chrome\.js}, 'dev page loads dev chrome');
+    # The crew page puts the link in a JS string, so the quotes are escaped.
+    ok($dev_page->{body} =~ m{/dev/account/}, 'dev page sign-in link');
+    ok($dev_page->{body} !~ m{href=\\"/account/"}, 'dev page does not link the prod sign-in');
+    my $qa_page = fcgi_do('GET', '/qa/dc/', '', cookie => $qa_admin);
+    ok($qa_page->{status} eq '200', 'admin /qa/dc/ is 200');
+    ok($qa_page->{body} =~ m{/qa/api/v1/dc/state}, 'qa page polls the qa API');
+    ok($qa_page->{body} =~ m{/qa/dc/chrome\.js}, 'qa page loads qa chrome');
+
     my $st = fcgi_do('GET', '/api/v1/dc/state', '', cookie => $fdh);
     my $sj = eval { decode_json($st->{body}) } || {};
     ok($st->{status} eq '200' && ref($sj->{agents}) eq 'ARRAY', 'allowlisted state JSON');
@@ -278,22 +334,31 @@ if ($up) {
             cookie => $fdh);
         ok($yes->{status} eq '200', 'send to a live berth is 200')
             or print "# send status=$yes->{status} body=$yes->{body}\n";
+        my $devyes = fcgi_do('POST', '/dev/api/v1/dc/send',
+            encode_json({ to => 'zhc', content => 'hello from dev' }),
+            cookie => 'ZHCSESS_DEV=aaaaaaaaaaaaaaaa');
+        ok($devyes->{status} eq '200', 'dev send to a live berth is 200')
+            or print "# dev send status=$devyes->{status} body=$devyes->{body}\n";
         my $saw = 0;
+        my $saw_dev = 0;
         my $saw_all = 0;
         eval {
             local $SIG{ALRM} = sub { die "timeout" };
             alarm 2;
             while (my $line = <$rx>) {
                 $saw_all = 1 if $line =~ /nope-all/;
-                if ($line =~ /hello captain/) { $saw = 1; last }
+                $saw = 1 if $line =~ /hello captain/;
+                $saw_dev = 1 if $line =~ /hello from dev/;
+                last if $saw && $saw_dev;
             }
             alarm 0;
         };
         alarm 0;
-        ok($saw && !$saw_all, 'berth got the line and not the all-send');
+        ok($saw && $saw_dev && !$saw_all, 'berth got prod and dev lines and not the all-send');
     } else {
         ok(0, 'to=all refused');
         ok(0, 'send 200');
+        ok(0, 'dev send 200');
         ok(0, 'berth received');
     }
 

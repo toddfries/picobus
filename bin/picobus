@@ -1809,6 +1809,7 @@ sub app_html {
 <script>
 (function () {
   var b = location.pathname.match(/^\/(dev|qa)(\/|$)/);
+  document.documentElement.setAttribute('data-zhc-bucket', b ? b[1] : 'prod');
   var k = 'ZHCTHEME_' + (b ? b[1].toUpperCase() : 'PROD');
   var m = document.cookie.match(new RegExp('(?:^|; )' + k + '=([^;]*)'));
   var v = m ? decodeURIComponent(m[1]) : 'system';
@@ -1890,6 +1891,10 @@ body {
 .dot {
   width:10px; height:10px; border-radius:50%; flex-shrink:0;
   background:var(--off);
+}
+/* Dev only, so /qa and prod stay at 10px while the larger ball is tested. */
+html[data-zhc-bucket="dev"] .dot {
+  width:calc(10px * 1.75); height:calc(10px * 1.75);
 }
 .dot.on,.dot.green { background:var(--green); }
 .dot.yellow { background:var(--yellow); }

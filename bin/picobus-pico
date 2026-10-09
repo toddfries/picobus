@@ -30,7 +30,22 @@ sub logmsg {
 }
 
 die "PICO_AGENTS required (id=host:port,...)\n" unless length $SPEC;
-die "PICO_TOKEN_DIR required\n" unless length $TOKEN_DIR && -d $TOKEN_DIR;
+if (!length $TOKEN_DIR) {
+    die "PICO_TOKEN_DIR required (unset)\n";
+}
+if (!-d $TOKEN_DIR) {
+    # -d is false for a missing path, a file, and EACCES on a parent.
+    # The hub chmod 0700s /var/picobus/secrets on every start. Tokens
+    # must not live under that directory or this is "Permission denied".
+    my $err = $!;
+    if (-e $TOKEN_DIR) {
+        $err = 'not a directory';
+    }
+    elsif (!$err) {
+        $err = 'not a directory';
+    }
+    die "PICO_TOKEN_DIR required ($err)\n";
+}
 
 my @agents;
 for my $part (split /,/, $SPEC) {
@@ -228,6 +243,21 @@ sub bus_reply {
     });
 }
 
+# $tx->result dies when the TCP connect fails. That exception is thrown
+# inside an I/O watcher, so Mojo::Reactor::EV exits the whole process.
+# One gateway being down must only mark that card down.
+sub tx_res {
+    my ($tx) = @_;
+    return unless $tx;
+    my $err = eval { $tx->error };
+    if ($err && ref $err eq 'HASH' && !defined $err->{code}) {
+        return;
+    }
+    my $res = eval { $tx->result };
+    return if $@ || !$res;
+    return $res;
+}
+
 sub poll_agent {
     my ($agent) = @_;
     my $base = "http://$agent->{host}:$agent->{port}";
@@ -243,8 +273,8 @@ sub poll_agent {
     $card->{port} = 0 + $agent->{port};
     $ua->get("$base/health" => sub {
         my ($ua, $tx) = @_;
-        my $res = $tx->result;
-        if ($res->is_success) {
+        my $res = tx_res($tx);
+        if ($res && $res->is_success) {
             my $j = eval { decode_json($res->body) } || {};
             $card->{health}   = $j->{status} // 'ok';
             $card->{pid}      = $j->{pid} if defined $j->{pid};
@@ -253,12 +283,15 @@ sub poll_agent {
         else {
             $card->{health}   = 'down';
             $card->{presence} = 'down';
+            $card->{seen}     = iso_now();
+            note_digest();
+            return;
         }
         $card->{seen} = iso_now();
         $ua->get("$base/ready" => sub {
             my ($ua, $tx) = @_;
-            my $res = $tx->result;
-            if ($res->is_success) {
+            my $res = tx_res($tx);
+            if ($res && $res->is_success) {
                 my $j = eval { decode_json($res->body) } || {};
                 $card->{ready} = $j->{status} // 'ready';
             }
@@ -267,15 +300,15 @@ sub poll_agent {
             }
             $ua->get("$base/beacon" => sub {
                 my ($ua, $tx) = @_;
-                my $res = $tx->result;
-                if ($res->is_success) {
+                my $res = tx_res($tx);
+                if ($res && $res->is_success) {
                     my $j = eval { decode_json($res->body) } || {};
                     if (!defined $j->{id} || $j->{id} eq $agent->{id}) {
                         $card->{nick} = $j->{nick} if defined $j->{nick} && $j->{nick} ne '';
                         $card->{role} = $j->{role} if defined $j->{role} && $j->{role} ne '';
                     }
                 }
-                elsif (($res->code // 0) == 404) {
+                elsif ($res && ($res->code // 0) == 404) {
                     $card->{nick} = undef;
                     $card->{role} = undef;
                 }

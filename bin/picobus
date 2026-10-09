@@ -180,6 +180,10 @@ $PICO_HOME //= ($ENV{HOME} || '/root') . '/.picoclaw';
 # umask is for the sockets. chmod restores the directory mode it would strip.
 mkdir $FILE_DIR, 0755 unless -d $FILE_DIR;
 chmod 0755, $FILE_DIR if -d $FILE_DIR;
+# 0700 on purpose: session.key and llm secrets. Pico tokens must not
+# live here. _picobus cannot search a 0700 parent, so picobus-pico
+# dies at startup with "PICO_TOKEN_DIR required (Permission denied)".
+# Tokens belong in $state/pico, a sibling of this directory.
 mkdir $SECRETS_DIR, 0700 unless -d $SECRETS_DIR;
 chmod 0700, $SECRETS_DIR if -d $SECRETS_DIR;
 mkdir $PICO_HOME, 0700 unless -d $PICO_HOME;

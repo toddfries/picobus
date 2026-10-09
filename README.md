@@ -38,7 +38,7 @@ polls) to talk to its neighbours. The Pico path *is* the turn.
 # /etc/picobus.conf
 # HUB_GROUP=picobus
 # PICO_AGENTS=worker=127.0.0.1:18790
-# PICO_TOKEN_DIR=/var/picobus/secrets/pico
+# PICO_TOKEN_DIR=/var/picobus/pico
 rcctl enable picobus picobus_pico
 rcctl start picobus picobus_pico
 ```
@@ -53,7 +53,10 @@ frame on that socket is one hub unicast. `bus.ack` or `bus.error`
 comes back on the same socket. Nick stays empty until `/beacon` returns
 it. Missing beacon is 404, not a guessed name.
 
-Token files are `$PICO_TOKEN_DIR/<id>` (one line, mode 0640). Put the
+Token files are `$PICO_TOKEN_DIR/<id>` (one line, mode 0640), default
+`/var/picobus/pico`. Do not put them under `/var/picobus/secrets`:
+the hub chmod `0700`s that directory on every start, `_picobus`
+cannot search it, and the bridge dies at startup. Put the
 same value under `channel_list.pico.settings.token` in that instance's
 `.security.yml` — never append YAML at EOF. Handshake `?session_id=`
 must match the `session_id` on `message.send` or Pico replies

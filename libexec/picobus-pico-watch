@@ -1,0 +1,77 @@
+#!/bin/ksh
+# Restart picobus-pico after it exits. Cron runs this once a minute.
+# OpenBSD rc does not respawn, and rc_bg=YES reports (ok) even when
+# the new process dies before rcctl check runs.
+#
+# If _picobus cannot use the token directory, log once and do not
+# start. That is the secrets/ mode 0700 failure. A restart loop would
+# only repeat "PICO_TOKEN_DIR required".
+set -u
+PATH=/usr/bin:/bin:/usr/sbin:/sbin:/usr/local/bin:/usr/local/sbin
+
+[ -f /etc/picobus.conf ] && . /etc/picobus.conf
+STATE=${PICOBUS_STATE:-/var/picobus}
+TOKEN=${PICO_TOKEN_DIR:-$STATE/pico}
+LOG=$STATE/picobus-pico-watch.log
+STAMP=$STATE/picobus-pico-watch.stamp
+
+note() {
+	printf '%s %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*" >>"$LOG"
+}
+
+if rcctl check picobus_pico >/dev/null 2>&1; then
+	rm -f "$STAMP"
+	exit 0
+fi
+
+# Nothing to register with until the hub socket is back.
+if [ ! -S /var/run/picoclaw/hub.sock ]; then
+	exit 0
+fi
+
+case $TOKEN in
+/[A-Za-z0-9/_.-]*) ;;
+*)
+	note "picobus_pico down; refusing odd token path"
+	exit 1
+	;;
+esac
+
+if su -s /bin/ksh _picobus -c "test -d '$TOKEN'"; then
+	visible=yes
+else
+	visible=no
+fi
+
+if [ "$visible" != yes ]; then
+	prev=$(cat "$STAMP" 2>/dev/null || true)
+	if [ "$prev" != blocked ]; then
+		note "picobus_pico down; token dir not usable by _picobus; not starting"
+		printf '%s\n' blocked >"$STAMP"
+	fi
+	exit 0
+fi
+
+rcctl start picobus_pico >/dev/null 2>&1
+sleep 2
+if rcctl check picobus_pico >/dev/null 2>&1; then
+	note "picobus_pico started"
+	rm -f "$STAMP"
+	exit 0
+fi
+
+# Log a failed start at most once every 10 minutes. Cron still retries
+# every minute so a later good start is not delayed by the quiet period.
+now=$(date -u +%s)
+prev=$(cat "$STAMP" 2>/dev/null || true)
+case $prev in
+fail:*)
+	last=${prev#fail:}
+	if [ "$last" -gt 0 ] 2>/dev/null && [ $((now - last)) -lt 600 ]; then
+		exit 1
+	fi
+	;;
+esac
+printf 'fail:%s\n' "$now" >"$STAMP"
+note "picobus_pico start did not stay up"
+exit 1

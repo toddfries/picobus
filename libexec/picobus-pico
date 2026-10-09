@@ -2,7 +2,8 @@
 # rc wrapper: env + exec picobus-pico.
 [ -f /etc/picobus.conf ] && . /etc/picobus.conf
 export HUB_SOCK=${HUB_SOCK:-/var/run/picoclaw/hub.sock}
-export PICO_TOKEN_DIR=${PICO_TOKEN_DIR:-${PICOBUS_STATE:-/var/picobus}/secrets/pico}
+# Sibling of secrets/, not inside it. The hub chmod 0700s secrets on start.
+export PICO_TOKEN_DIR=${PICO_TOKEN_DIR:-${PICOBUS_STATE:-/var/picobus}/pico}
 if [ -n "${PICO_AGENTS:-}" ]; then
 	export PICO_AGENTS
 else

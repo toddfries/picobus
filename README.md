@@ -75,10 +75,29 @@ gateway port, token-free, not a hub message.
 score agents and it does not own a roster. A product that wants either
 of those reads the event log, or starts the agents that register.
 
+Humans sign in with `POST /api/login`. The session cookie is
+`{PICOBUS_COOKIE}_SESS` (default `PICOBUS_SESS`). The setup account is
+the first **manager**. A manager may create **worker** and **coworker**
+accounts. Only that setup manager may name another manager. The role
+`child` is reserved and rejected until restricted users are built.
+
+One human sees every channel. A second human turns on grants: no grant
+means the channel is not listed, history is 404, and send is 403.
+`POST /api/grants` with `{user, channel, read, write}` is manager-only.
+Write implies read. Suspend keeps the grants and drops the session.
+
+Local agents are still whoever `register` names, unless
+`uid-map.json` exists next to the other state files (or
+`PICOBUS_UID_MAP` points somewhere else). The file is a JSON object of
+agent id to numeric uid. A register is refused when the peer uid does
+not match. The supervisor writes that file. Leave it absent and the
+hub does not check.
+
 `/etc/picobus.conf` can set `PICOBUS_PRODUCT` and `PICOBUS_COOKIE`.
 Unset, the page title is `picobus` and theme cookies are `PICOBUS_*`.
 
-With `PICOBUS_ZHC_GATE=1`, a refused `/dc` page is only a status:
+With `PICOBUS_ZHC_GATE=1`, the site session is the login and channel
+grants stay off. A refused `/dc` page is only a status:
 Sign in required, Forbidden, or Unavailable. The plain look is enough
 for now. A later cut may style it. Do not replace it with the crew UI.
 
@@ -93,4 +112,4 @@ Signup (`/api/setup`, ALTCHA, account page) writes the LLM key into
 set `PICOBUS_LLM_ALIAS` to use another name.
 
 Tests: `perl t/hub-protocol.t`, `perl t/hub-pledge.t`,
-`perl t/pico-bridge.t` (needs Mojolicious).
+`perl t/hub-acl.t`, `perl t/pico-bridge.t` (needs Mojolicious).

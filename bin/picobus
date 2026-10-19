@@ -30,6 +30,7 @@ use Fcntl qw(F_GETFL F_SETFL O_NONBLOCK);
 use FindBin;
 use Digest::SHA qw(sha256_hex hmac_sha256_hex);
 use MIME::Base64 qw(decode_base64);
+use Socket qw(SOL_SOCKET);
 $| = 1;
 
 # ---------- config (env overrides; rc wrapper sets the service defaults) ----------
@@ -65,6 +66,12 @@ my $ZHC_SESS_DIR = $ENV{PICOBUS_ZHC_SESSION_DIR} // '/var/www/tmp/php-sessions-z
 my $ZHC_DB       = $ENV{PICOBUS_ZHC_DB} // '/var/www/data/escalate.sqlite';
 # Set from the request path before a gated page or API is rendered.
 my $ZHC_REQ_BUCKET = 'prod';
+# Picobus humans. Defaults are filled in after SETUP_FILE is known.
+# Absent uid map: do not check the peer. ZHC gate does not use these.
+my $PRINCIPALS_FILE = $ENV{PRINCIPALS_FILE};
+my $GRANTS_FILE     = $ENV{GRANTS_FILE};
+my $SESSIONS_FILE   = $ENV{SESSIONS_FILE};
+my $UID_MAP         = $ENV{PICOBUS_UID_MAP};
 # -----------------------------------------
 
 umask $UMASK;
@@ -105,7 +112,7 @@ sub hub_sandbox {
         1;
     } or return;
     my %dir;
-    for my $p ($HUB_SOCK, $HUB_LOG, $FCGI_SOCK, $CHAT_LOG, $FILE_DIR, $SETUP_FILE, $SECRETS_DIR) {
+    for my $p ($HUB_SOCK, $HUB_LOG, $FCGI_SOCK, $CHAT_LOG, $FILE_DIR, $SETUP_FILE, $SECRETS_DIR, $PRINCIPALS_FILE, $GRANTS_FILE, $SESSIONS_FILE, $UID_MAP) {
         next unless defined $p && length $p;
         my $d = _parent_dir($p);
         $dir{$d} = 'rwc' if defined $d;
@@ -163,6 +170,13 @@ $CHAT_LOG    //= (_parent_dir($HUB_LOG) || '.') . '/chat.ndjson';
 $FILE_DIR    //= (_parent_dir($HUB_LOG) || '.') . '/files';
 $SETUP_FILE  //= (_parent_dir($HUB_LOG) || '.') . '/setup.json';
 $SECRETS_DIR //= (_parent_dir($HUB_LOG) || '.') . '/secrets';
+{
+    my $state = _parent_dir($SETUP_FILE) || _parent_dir($HUB_LOG) || '.';
+    $PRINCIPALS_FILE //= "$state/principals.json";
+    $GRANTS_FILE     //= "$state/grants.json";
+    $SESSIONS_FILE   //= "$state/sessions.json";
+    $UID_MAP         //= "$state/uid-map.json";
+}
 if (!defined $SHARE_DIR || $SHARE_DIR eq '') {
     my $dev = "$FindBin::Bin/../share";
     $SHARE_DIR = (-d $dev) ? $dev : '/usr/local/share/picobus';
@@ -395,6 +409,11 @@ sub bind_registered_agent {
     return unless $fh && defined $new && $new ne '' && $new !~ /^(?:anon|gone)-/;
     my $fn = fileno($fh);
     return unless defined $fn;
+    if (!register_allowed($fh, $new)) {
+        send_json($fh, { type => 'error', msg => 'register refused' });
+        log_msg({ type => 'error', msg => 'register refused', id => $new });
+        return 0;
+    }
     if (defined $old_id && $old_id ne $new && $old_id =~ /^anon-/) {
         delete $agents{$old_id};
     }
@@ -416,6 +435,7 @@ sub bind_registered_agent {
     ensure_dm_channel($new);
     refresh_team_group();
     log_msg({ type => 'register', id => $new }) unless $already;
+    return 1;
 }
 
 sub close_agent {
@@ -649,6 +669,223 @@ sub save_setup {
     return 1;
 }
 
+# ---------- humans, roles, channel grants ----------
+# One human (the setup manager) sees every channel. A second human turns
+# grants on for everyone, including that manager. Role child is reserved.
+# PICOBUS_ZHC_GATE keeps the site session and does not use these grants.
+
+sub read_json_file {
+    my ($path) = @_;
+    return unless $path && -f $path;
+    open my $fh, '<', $path or return;
+    local $/;
+    my $j = eval { decode_json(<$fh>) };
+    close $fh;
+    return ($j && ref $j eq 'HASH') ? $j : undef;
+}
+
+sub write_json_file {
+    my ($path, $obj) = @_;
+    return 0 unless $path;
+    my $dir = _parent_dir($path);
+    mkdir $dir, 0755 if $dir && !-d $dir;
+    open my $fh, '>', $path or return 0;
+    print $fh encode_json($obj);
+    close $fh;
+    chmod 0600, $path;
+    return 1;
+}
+
+sub load_principals {
+    my $p = read_json_file($PRINCIPALS_FILE);
+    return $p if $p && keys %$p;
+    my $s = load_setup() or return {};
+    return {} unless $s->{complete} && $s->{user} && $s->{pass_hash};
+    $p = {
+        $s->{user} => {
+            id        => $s->{user},
+            role      => 'manager',
+            status    => 'active',
+            founder   => JSON::PP::true,
+            pass_hash => $s->{pass_hash},
+        },
+    };
+    write_json_file($PRINCIPALS_FILE, $p);
+    return $p;
+}
+
+sub save_principals { write_json_file($PRINCIPALS_FILE, $_[0]) }
+
+sub load_grants { read_json_file($GRANTS_FILE) || {} }
+sub save_grants { write_json_file($GRANTS_FILE, $_[0]) }
+
+sub load_sessions { read_json_file($SESSIONS_FILE) || {} }
+sub save_sessions { write_json_file($SESSIONS_FILE, $_[0]) }
+
+sub acl_strict {
+    return 0 if zhc_gate();
+    my $p = load_principals();
+    return (scalar keys %$p) > 1;
+}
+
+sub principal_suspended {
+    my ($u) = @_;
+    return $u && ($u->{status} // '') eq 'suspended';
+}
+
+sub grant_row {
+    my ($id, $chan) = @_;
+    my $g = load_grants();
+    return unless $g->{$chan} && ref $g->{$chan} eq 'HASH';
+    return $g->{$chan}{$id};
+}
+
+sub can_read {
+    my ($user, $chan) = @_;
+    return 0 unless $user && ref $user eq 'HASH';
+    return 0 if principal_suspended($user);
+    return 1 unless acl_strict();
+    my $row = grant_row($user->{id}, $chan) or return 0;
+    return ($row->{read} || $row->{write}) ? 1 : 0;
+}
+
+sub can_write {
+    my ($user, $chan) = @_;
+    return 0 unless $user && ref $user eq 'HASH';
+    return 0 if principal_suspended($user);
+    return 1 unless acl_strict();
+    my $row = grant_row($user->{id}, $chan) or return 0;
+    return $row->{write} ? 1 : 0;
+}
+
+sub valid_user_id {
+    my ($id) = @_;
+    return $id && $id =~ /^[a-zA-Z][a-zA-Z0-9._-]{1,31}$/;
+}
+
+sub role_ok {
+    my ($role) = @_;
+    return $role && ($role eq 'worker' || $role eq 'coworker' || $role eq 'manager');
+}
+
+sub session_cookie_name {
+    my $p = $COOKIE_PREFIX;
+    $p =~ s/[^A-Za-z0-9_]//g;
+    $p = 'PICOBUS' unless length $p;
+    return $p . '_SESS';
+}
+
+sub cookie_value {
+    my ($name) = @_;
+    my $c = $ENV{HTTP_COOKIE} // '';
+    return unless $c =~ /(?:^|;\s*)\Q$name\E=([^;]*)/;
+    my $v = $1;
+    $v =~ s/^\s+|\s+$//g;
+    return $v;
+}
+
+sub session_cookie_hdr {
+    my ($token) = @_;
+    my $name = session_cookie_name();
+    if (!defined $token || $token eq '') {
+        return "$name=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0";
+    }
+    return "$name=$token; HttpOnly; SameSite=Lax; Path=/";
+}
+
+sub mint_session {
+    my ($id) = @_;
+    my $token = sprintf('%08x%08x%08x%08x', map { int(rand(2**32)) } 1 .. 4);
+    my $all = load_sessions();
+    my $now = time();
+    for my $k (keys %$all) {
+        delete $all->{$k} if ($all->{$k}{exp} // 0) < $now;
+    }
+    $all->{$token} = { user => $id, exp => $now + 14 * 24 * 3600 };
+    save_sessions($all);
+    return $token;
+}
+
+sub drop_user_sessions {
+    my ($id) = @_;
+    my $all = load_sessions();
+    for my $k (keys %$all) {
+        delete $all->{$k} if ($all->{$k}{user} // '') eq $id;
+    }
+    save_sessions($all);
+}
+
+sub session_principal {
+    my $token = cookie_value(session_cookie_name());
+    return unless $token;
+    my $all = load_sessions();
+    my $row = $all->{$token} or return;
+    if (($row->{exp} // 0) < time()) {
+        delete $all->{$token};
+        save_sessions($all);
+        return;
+    }
+    my $p = load_principals();
+    my $u = $p->{ $row->{user} // '' } or return;
+    return $u;
+}
+
+sub public_user {
+    my ($u) = @_;
+    return {
+        id      => $u->{id},
+        role    => $u->{role},
+        status  => $u->{status} // 'active',
+        founder => $u->{founder} ? JSON::PP::true : JSON::PP::false,
+    };
+}
+
+sub arm_founder_grants {
+    my ($founder_id) = @_;
+    my $g = load_grants();
+    for my $cid (keys %$g) {
+        return if $g->{$cid} && $g->{$cid}{$founder_id};
+    }
+    for my $cid (keys %channels, 'all') {
+        $g->{$cid}{$founder_id} = {
+            read  => JSON::PP::true,
+            write => JSON::PP::true,
+        };
+    }
+    save_grants($g);
+}
+
+sub peer_uid {
+    my ($sock) = @_;
+    return unless $sock;
+    my $cred = getsockopt($sock, SOL_SOCKET, 0x1022);
+    return unless defined $cred && length($cred) >= 4;
+    my ($uid) = unpack('L', $cred);
+    return $uid;
+}
+
+sub uid_map {
+    my $m = read_json_file($UID_MAP);
+    return {} unless $m;
+    my %out;
+    for my $id (keys %$m) {
+        my $uid = $m->{$id};
+        next unless defined $uid && $uid =~ /^\d+$/;
+        $out{$id} = 0 + $uid;
+    }
+    return \%out;
+}
+
+sub register_allowed {
+    my ($sock, $id) = @_;
+    return 0 if !defined $id || $id eq '' || $id eq 'human' || $id =~ /^anon-/;
+    my $map = uid_map();
+    return 1 unless $map && keys %$map;
+    return 0 unless exists $map->{$id};
+    my $uid = peer_uid($sock);
+    return defined $uid && $uid == $map->{$id};
+}
+
 # ---------- FastCGI: Discord-alike UI + JSON API ----------
 # POST: read CONTENT_LENGTH + STDIN (urlencoded forms AND JSON /api/send).
 # QUERY_STRING still works for GET inject / ?format=json.
@@ -746,6 +983,7 @@ sub json_out {
     my $extra = '';
     $extra .= 'ETag: "' . $hdr->{etag} . '"' . "\r\n" if $hdr->{etag};
     $extra .= 'Expires: ' . $hdr->{expires} . "\r\n" if $hdr->{expires};
+    $extra .= 'Set-Cookie: ' . $hdr->{cookie} . "\r\n" if $hdr->{cookie};
     if ($code == 304) {
         cgi_out("Status: 304 Not Modified\r\nCache-Control: $cc\r\n${extra}\r\n");
         return;
@@ -771,14 +1009,15 @@ sub normalize_to {
 }
 
 sub inject_human_message {
-    my ($to, $content, $files) = @_;
+    my ($from, $to, $content, $files) = @_;
+    $from = 'human' unless defined $from && length $from;
     $content = '' unless defined $content;
     $content =~ s/^\s+|\s+$//g;
     $files = [] unless $files && ref $files eq 'ARRAY';
     return 0 unless length $content || @$files;
     my $obj = {
         type    => 'message',
-        from    => 'human',
+        from    => $from,
         to      => normalize_to($to),
         content => $content,
         id      => 'h-' . time() . int(rand(1000)),
@@ -923,8 +1162,42 @@ sub new_file_id {
     return $id;
 }
 
+sub file_visible {
+    my ($user, $meta) = @_;
+    return 0 unless $user;
+    return 1 unless acl_strict();
+    return 1 if ($meta->{owner} // '') ne '' && $meta->{owner} eq $user->{id};
+    my $id = $meta->{id} // '';
+    return 0 if $id eq '';
+    for my $m (@log) {
+        next unless $m->{files} && ref $m->{files} eq 'ARRAY';
+        my $hit = 0;
+        for my $f (@{ $m->{files} }) {
+            $hit = 1 if $f && ref $f eq 'HASH' && ($f->{id} // '') eq $id;
+        }
+        next unless $hit;
+        return 1 if can_read($user, normalize_to($m->{to} // ''));
+    }
+    return 0;
+}
+
+sub has_any_write {
+    my ($user) = @_;
+    return 0 unless $user;
+    return 1 unless acl_strict();
+    return 1 if can_write($user, 'all');
+    for my $cid (keys %channels) {
+        return 1 if can_write($user, $cid);
+    }
+    my $g = load_grants();
+    for my $chan (keys %$g) {
+        return 1 if can_write($user, $chan);
+    }
+    return 0;
+}
+
 sub save_upload {
-    my ($name, $mime, $bytes) = @_;
+    my ($name, $mime, $bytes, $owner) = @_;
     return unless defined $bytes && length $bytes;
     return if length($bytes) > $MAX_UPLOAD;
     $name = 'file' unless defined $name && $name =~ /\S/;
@@ -944,6 +1217,7 @@ sub save_upload {
         bytes => length($bytes),
         mime  => $mime,
         url   => (zhc_gate() ? zhc_req_prefix() . '/api/v1/dc/files/' : '/api/files/') . $id,
+        owner => $owner // '',
     };
     if (open my $mf, '>', file_meta_path($id)) {
         print $mf encode_json($meta);
@@ -972,26 +1246,50 @@ sub agent_record {
     };
 }
 
+sub channel_visible {
+    my ($user, $cid) = @_;
+    return 1 if zhc_gate();
+    return 0 if acl_strict() && !$user;
+    return 1 unless acl_strict();
+    return can_read($user, $cid);
+}
+
 sub hub_state {
-    my @agents;
-    for my $id (sort keys %agents) {
-        next if $id =~ /^anon-/ || $id eq 'human' || $id eq '';
-        push @agents, agent_record($id, 1);
-    }
+    my ($user) = @_;
+    my $strict = acl_strict();
+    my %seen_agent;
     my @chlist;
     for my $cid (sort keys %channels) {
+        next if $strict && !channel_visible($user, $cid);
         my $c = $channels{$cid};
         push @chlist, {
             id      => $c->{id},
             kind    => $c->{kind},
             name    => $c->{name},
             members => [ @{ $c->{members} || [] } ],
+            write   => ($user && can_write($user, $cid)) ? JSON::PP::true : JSON::PP::false,
         };
+        $seen_agent{$_} = 1 for @{ $c->{members} || [] };
+        $seen_agent{$cid} = 1 if ($c->{kind} // '') eq 'dm';
+    }
+    my @agents;
+    for my $id (sort keys %agents) {
+        next if $id =~ /^anon-/ || $id eq 'human' || $id eq '';
+        if ($strict) {
+            next unless $user && ($seen_agent{$id} || can_read($user, $id));
+        }
+        push @agents, agent_record($id, 1);
+    }
+    my $me;
+    if ($user) {
+        $me = public_user($user);
+        $me->{strict} = $strict ? JSON::PP::true : JSON::PP::false;
     }
     return {
         agents   => \@agents,
         seq      => scalar(@log),
         channels => \@chlist,
+        me       => $me,
     };
 }
 
@@ -1479,8 +1777,255 @@ sub handle_fcgi {
     }
 
     if (!zhc_gate() && $method eq 'POST' && !setup_complete()
-        && $path =~ m{/api/(send|channels|files)}i) {
+        && $path =~ m{/api/(send|channels|files|login|users|grants)}i) {
         json_out(503, { ok => \0, error => 'setup required' });
+        return;
+    }
+
+    if (!zhc_gate() && $path =~ m{^/api/login/?$}i && $method eq 'POST') {
+        my $obj = eval { decode_json($body) } || {};
+        my $id = $obj->{user} // '';
+        my $pw = $obj->{password} // '';
+        $id =~ s/^\s+|\s+$//g;
+        my $p = load_principals();
+        my $u = $p->{$id};
+        if (!$u || !bcrypt_ok($pw, $u->{pass_hash})) {
+            json_out(401, { ok => \0, error => 'bad login' });
+            return;
+        }
+        if (principal_suspended($u)) {
+            json_out(403, { ok => \0, error => 'suspended' });
+            return;
+        }
+        my $token = mint_session($id);
+        json_out(200, { ok => \1, user => public_user($u) }, {
+            cookie => session_cookie_hdr($token),
+        });
+        return;
+    }
+
+    my $me;
+    my $needs_user = !zhc_gate() && setup_complete()
+        && $path =~ m{^/api/(history|send|files|state|channels|users|grants|me|logout)\b}i;
+    if ($needs_user) {
+        $me = session_principal();
+        if (!$me) {
+            json_out(401, { ok => \0, error => 'login required' });
+            return;
+        }
+        if (principal_suspended($me)) {
+            drop_user_sessions($me->{id});
+            json_out(403, { ok => \0, error => 'suspended' }, {
+                cookie => session_cookie_hdr(''),
+            });
+            return;
+        }
+    }
+
+    if (!zhc_gate() && $path =~ m{^/api/logout/?$}i && $method eq 'POST') {
+        my $token = cookie_value(session_cookie_name());
+        if ($token) {
+            my $all = load_sessions();
+            delete $all->{$token};
+            save_sessions($all);
+        }
+        json_out(200, { ok => \1 }, { cookie => session_cookie_hdr('') });
+        return;
+    }
+
+    if (!zhc_gate() && $path =~ m{^/api/me/?$}i) {
+        if (!$me) {
+            json_out(401, { ok => \0, error => 'login required' });
+            return;
+        }
+        json_out(200, {
+            ok => \1,
+            %{ public_user($me) },
+            strict => acl_strict() ? JSON::PP::true : JSON::PP::false,
+        });
+        return;
+    }
+
+    if (!zhc_gate() && $path =~ m{^/api/users/?$}i) {
+        if (!$me || ($me->{role} // '') ne 'manager') {
+            json_out(403, { ok => \0, error => 'manager only' });
+            return;
+        }
+        my $people = load_principals();
+        if ($method eq 'GET') {
+            json_out(200, {
+                ok => \1,
+                users => [ map { public_user($_) } sort { $a->{id} cmp $b->{id} } values %$people ],
+            });
+            return;
+        }
+        if ($method ne 'POST') {
+            json_out(405, { ok => \0, error => 'GET or POST' });
+            return;
+        }
+        my $obj = eval { decode_json($body) } || {};
+        my $id = $obj->{id} // $obj->{user} // '';
+        $id =~ s/^\s+|\s+$//g;
+        my $role = $obj->{role} // 'worker';
+        if ($role eq 'child') {
+            json_out(400, { ok => \0, error => 'child is reserved for a later phase' });
+            return;
+        }
+        if (!role_ok($role)) {
+            json_out(400, { ok => \0, error => 'role must be worker, coworker, or manager' });
+            return;
+        }
+        if ($role eq 'manager' && !$me->{founder}) {
+            json_out(403, { ok => \0, error => 'only the setup manager can name another manager' });
+            return;
+        }
+        if (!valid_user_id($id)) {
+            json_out(400, { ok => \0, error => 'username: letters, 2–32 chars' });
+            return;
+        }
+        if ($people->{$id}) {
+            json_out(400, { ok => \0, error => 'user exists' });
+            return;
+        }
+        my $pw = $obj->{password} // '';
+        if (length($pw) < 8) {
+            json_out(400, { ok => \0, error => 'password at least 8 characters' });
+            return;
+        }
+        my $was_strict = acl_strict();
+        $people->{$id} = {
+            id        => $id,
+            role      => $role,
+            status    => 'active',
+            founder   => JSON::PP::false,
+            pass_hash => bcrypt_hash($pw),
+        };
+        save_principals($people);
+        arm_founder_grants($me->{id}) unless $was_strict;
+        json_out(200, { ok => \1, user => public_user($people->{$id}) });
+        return;
+    }
+
+    if (!zhc_gate() && $path =~ m{^/api/users/([^/]+)/?$}i) {
+        my $id = $1;
+        if (!$me || ($me->{role} // '') ne 'manager') {
+            json_out(403, { ok => \0, error => 'manager only' });
+            return;
+        }
+        if ($method ne 'POST') {
+            json_out(405, { ok => \0, error => 'POST required' });
+            return;
+        }
+        my $people = load_principals();
+        my $u = $people->{$id};
+        if (!$u) {
+            json_out(404, { ok => \0, error => 'no such user' });
+            return;
+        }
+        my $obj = eval { decode_json($body) } || {};
+        my $op = $obj->{op} // '';
+        if ($op eq 'suspend') {
+            if ($u->{founder}) {
+                json_out(403, { ok => \0, error => 'the setup manager cannot be suspended' });
+                return;
+            }
+            $u->{status} = 'suspended';
+            $people->{$id} = $u;
+            save_principals($people);
+            drop_user_sessions($id);
+            json_out(200, { ok => \1, user => public_user($u) });
+            return;
+        }
+        if ($op eq 'restore') {
+            $u->{status} = 'active';
+            $people->{$id} = $u;
+            save_principals($people);
+            json_out(200, { ok => \1, user => public_user($u) });
+            return;
+        }
+        if ($op eq 'role') {
+            my $role = $obj->{role} // '';
+            if ($role eq 'child') {
+                json_out(400, { ok => \0, error => 'child is reserved for a later phase' });
+                return;
+            }
+            if (!role_ok($role)) {
+                json_out(400, { ok => \0, error => 'role must be worker, coworker, or manager' });
+                return;
+            }
+            if ($u->{founder} && $role ne 'manager') {
+                json_out(403, { ok => \0, error => 'the setup manager stays a manager' });
+                return;
+            }
+            if ($role eq 'manager' && !$me->{founder}) {
+                json_out(403, { ok => \0, error => 'only the setup manager can name another manager' });
+                return;
+            }
+            $u->{role} = $role;
+            $people->{$id} = $u;
+            save_principals($people);
+            json_out(200, { ok => \1, user => public_user($u) });
+            return;
+        }
+        if ($op eq 'password') {
+            my $pw = $obj->{password} // '';
+            if (length($pw) < 8) {
+                json_out(400, { ok => \0, error => 'password at least 8 characters' });
+                return;
+            }
+            $u->{pass_hash} = bcrypt_hash($pw);
+            $people->{$id} = $u;
+            save_principals($people);
+            drop_user_sessions($id);
+            json_out(200, { ok => \1 });
+            return;
+        }
+        json_out(400, { ok => \0, error => 'op must be suspend, restore, role, or password' });
+        return;
+    }
+
+    if (!zhc_gate() && $path =~ m{^/api/grants/?$}i) {
+        if (!$me || ($me->{role} // '') ne 'manager') {
+            json_out(403, { ok => \0, error => 'manager only' });
+            return;
+        }
+        if ($method eq 'GET') {
+            json_out(200, { ok => \1, grants => load_grants() });
+            return;
+        }
+        if ($method ne 'POST') {
+            json_out(405, { ok => \0, error => 'GET or POST' });
+            return;
+        }
+        my $obj = eval { decode_json($body) } || {};
+        my $id = $obj->{user} // '';
+        my $raw_chan = $obj->{channel} // '';
+        $raw_chan =~ s/^\s+|\s+$//g;
+        if (!valid_user_id($id) || $raw_chan eq '') {
+            json_out(400, { ok => \0, error => 'user and channel required' });
+            return;
+        }
+        my $chan = normalize_to($raw_chan);
+        my $people = load_principals();
+        if (!$people->{$id}) {
+            json_out(404, { ok => \0, error => 'no such user' });
+            return;
+        }
+        my $read = $obj->{read} ? 1 : 0;
+        my $write = $obj->{write} ? 1 : 0;
+        $read = 1 if $write;
+        my $g = load_grants();
+        if (!$read && !$write) {
+            delete $g->{$chan}{$id} if $g->{$chan};
+            delete $g->{$chan} if $g->{$chan} && !keys %{ $g->{$chan} };
+        } else {
+            $g->{$chan}{$id} = {
+                read  => $read  ? JSON::PP::true : JSON::PP::false,
+                write => $write ? JSON::PP::true : JSON::PP::false,
+            };
+        }
+        save_grants($g);
+        json_out(200, { ok => \1, grants => $g });
         return;
     }
 
@@ -1492,6 +2037,10 @@ sub handle_fcgi {
         }
         my $meta = load_file_meta($id);
         if (!$meta) {
+            json_out(404, { ok => \0, error => 'no such file' });
+            return;
+        }
+        if ($me && acl_strict() && !file_visible($me, $meta)) {
             json_out(404, { ok => \0, error => 'no such file' });
             return;
         }
@@ -1529,7 +2078,11 @@ sub handle_fcgi {
             json_out(400, { ok => \0, error => 'send raw file body, not json' });
             return;
         }
-        my $meta = save_upload($name, $q->{mime} || $ctype, $body);
+        if ($me && acl_strict() && !has_any_write($me)) {
+            json_out(403, { ok => \0, error => 'read only' });
+            return;
+        }
+        my $meta = save_upload($name, $q->{mime} || $ctype, $body, $me ? $me->{id} : '');
         if (!$meta) {
             json_out(400, { ok => \0, error => 'upload failed' });
             return;
@@ -1550,10 +2103,15 @@ sub handle_fcgi {
                             kind    => $c->{kind},
                             name    => $c->{name},
                             members => [ @{ $c->{members} || [] } ],
+                            write   => ($me && can_write($me, $_)) ? JSON::PP::true : JSON::PP::false,
                         }
-                    } sort keys %channels
+                    } grep { channel_visible($me, $_) } sort keys %channels
                 ],
             });
+            return;
+        }
+        if ($me && acl_strict() && ($me->{role} // '') ne 'manager') {
+            json_out(403, { ok => \0, error => 'manager only' });
             return;
         }
         if ($method ne 'POST') {
@@ -1572,6 +2130,10 @@ sub handle_fcgi {
 
     if ($path =~ m{/api/history/?$}i) {
         my $chan  = normalize_to($q->{channel} // $q->{chan} // 'all');
+        if ($me && !can_read($me, $chan)) {
+            json_out(404, { ok => \0, error => 'not found' });
+            return;
+        }
         my $page  = $q->{page};
         $page = -1 if !defined $page || $page eq '' || $page eq 'last';
         $page = 0 + $page if $page =~ /^-?\d+$/;
@@ -1633,11 +2195,16 @@ sub handle_fcgi {
                     push @files, $meta;
                 }
             }
-            if (!inject_human_message($to, $content, \@files)) {
+            $to = normalize_to($to);
+            if ($me && !can_write($me, $to)) {
+                json_out(403, { ok => \0, error => 'read only' });
+                return;
+            }
+            if (!inject_human_message($me ? $me->{id} : 'human', $to, $content, \@files)) {
                 json_out(400, { ok => \0, error => 'content required' });
                 return;
             }
-            json_out(200, { ok => \1, to => normalize_to($to) });
+            json_out(200, { ok => \1, to => $to });
             return;
         } else {
             $to      = $q->{to};
@@ -1647,11 +2214,16 @@ sub handle_fcgi {
                 return;
             }
         }
-        if (!inject_human_message($to, $content)) {
+        $to = normalize_to($to);
+        if ($me && !can_write($me, $to)) {
+            json_out(403, { ok => \0, error => 'read only' });
+            return;
+        }
+        if (!inject_human_message($me ? $me->{id} : 'human', $to, $content)) {
             json_out(400, { ok => \0, error => 'content required' });
             return;
         }
-        json_out(200, { ok => \1, to => normalize_to($to) });
+        json_out(200, { ok => \1, to => $to });
         return;
     }
 
@@ -1660,7 +2232,22 @@ sub handle_fcgi {
             json_out(400, { ok => \0, error => 'pick a live berth' });
             return;
         }
-        inject_human_message($q->{to}, $q->{content});
+        my $from = 'human';
+        my $to = $q->{to};
+        if (!zhc_gate() && setup_complete()) {
+            my $who = $me || session_principal();
+            if (!$who) {
+                json_out(401, { ok => \0, error => 'login required' });
+                return;
+            }
+            $to = normalize_to($to);
+            if (!can_write($who, $to)) {
+                json_out(403, { ok => \0, error => 'read only' });
+                return;
+            }
+            $from = $who->{id};
+        }
+        inject_human_message($from, $to, $q->{content});
         if (!$want_json && $method eq 'POST') {
             my $loc = zhc_gate() ? zhc_req_prefix() . '/dc/' : '/';
             cgi_out("Status: 303 See Other\r\nLocation: $loc\r\nCache-Control: no-store\r\n\r\n");
@@ -1669,7 +2256,7 @@ sub handle_fcgi {
     }
 
     if ($want_json) {
-        json_out(200, hub_state());
+        json_out(200, hub_state(zhc_gate() ? undef : ($me || session_principal())));
         return;
     }
 
@@ -1719,6 +2306,7 @@ sub apply_brand {
     $html =~ s/__API__/$api/g;
     $html =~ s/__PAGE__/$page/g;
     $html =~ s/__ACCOUNT__/$acct/g;
+    $html =~ s/__NEED_LOGIN__/$ZHC_GATE ? '0' : '1'/ge;
     return $html;
 }
 
@@ -2042,12 +2630,62 @@ html[data-zhc-theme="light"] .msg .body pre code { background:transparent; }
 html[data-zhc-theme="light"] .filechip a.name { color:#0b57d0; }
 html[data-zhc-theme="light"] .transcript::-webkit-scrollbar-thumb,
 html[data-zhc-theme="light"] #channels::-webkit-scrollbar-thumb { background:#c4c6cc; }
+.login-wrap, .acct-wrap {
+  position:fixed; inset:0; background:rgba(0,0,0,.55);
+  display:flex; align-items:center; justify-content:center; z-index:20;
+}
+.login-wrap[hidden], .acct-wrap[hidden] { display:none !important; }
+.login-card, .acct-card {
+  background:var(--side); color:var(--text); padding:22px; border-radius:8px;
+  width:min(420px, calc(100% - 32px));
+}
+.login-card h2, .acct-card h2 { margin:0 0 12px; font-size:18px; }
+.login-card input, .acct-card > input, .acct-card select {
+  display:block; width:100%; box-sizing:border-box; margin:0 0 8px;
+  background:#1e1f22; color:var(--text); border:0; border-radius:4px; padding:8px;
+}
+.login-card button, .acct-card button { margin-right:8px; margin-top:6px; }
+.login-err { color:#ed4245; font-size:13px; min-height:1.2em; }
+.acct-btn { margin:8px 16px; background:var(--sel); color:var(--head);
+  border:0; border-radius:4px; padding:6px 8px; cursor:pointer; font:inherit; }
 </style>
 </head>
 <body>
+<div id="login" class="login-wrap" hidden>
+  <form class="login-card" id="login-form">
+    <h2>Sign in</h2>
+    <input id="login-user" autocomplete="username" placeholder="username">
+    <input id="login-pass" type="password" autocomplete="current-password" placeholder="password">
+    <button type="submit">Sign in</button>
+    <p class="login-err" id="login-err"></p>
+  </form>
+</div>
+<div id="acct" class="acct-wrap" hidden>
+  <form class="acct-card" id="acct-form">
+    <h2>People</h2>
+    <input id="acct-user" placeholder="username">
+    <input id="acct-pass" type="password" placeholder="initial password">
+    <select id="acct-role">
+      <option value="worker">worker</option>
+      <option value="coworker">coworker</option>
+      <option value="manager">manager</option>
+    </select>
+    <input id="acct-chan" placeholder="channel (grant)">
+    <label><input id="acct-read" type="checkbox" checked> read</label>
+    <label><input id="acct-write" type="checkbox"> write</label>
+    <div>
+      <button type="submit">Create</button>
+      <button type="button" id="acct-grant">Set grant</button>
+      <button type="button" id="acct-close">Close</button>
+    </div>
+    <p class="login-err" id="acct-err"></p>
+    <pre id="acct-list"></pre>
+  </form>
+</div>
 <div class="app">
   <aside class="sidebar">
     <div class="brand">__PRODUCT__</div>
+    <button type="button" class="acct-btn" id="acct-open" hidden>People</button>
     <div class="chan-label">Channels</div>
     <div id="channels">
       <button type="button" class="chan sel" data-id="all"><span class="hash">#</span>broadcast</button>
@@ -2079,6 +2717,8 @@ html[data-zhc-theme="light"] #channels::-webkit-scrollbar-thumb { background:#c4
 <script>
 (function () {
   var selected = "all";
+  var needLogin = __NEED_LOGIN__;
+  var currentUser = null;
   var pinned = false;
   var lastAgentsRaw = "";
   var lastData = { agents: [], scores: {}, seq: 0 };
@@ -2360,11 +3000,35 @@ html[data-zhc-theme="light"] #channels::-webkit-scrollbar-thumb { background:#c4
     });
     pane = paneMap[id].el;
   }
+  function groupLocked() {
+    return !needLogin && selected.indexOf("g:") === 0;
+  }
+  function channelRec(id) {
+    var chs = lastData.channels || [];
+    for (var i = 0; i < chs.length; i++) if (chs[i].id === id) return chs[i];
+    return null;
+  }
+  function channelWrite(id) {
+    if (!needLogin) return true;
+    var me = (lastData && lastData.me) || currentUser;
+    if (!me || !me.strict) return true;
+    var c = channelRec(id);
+    return !!(c && c.write);
+  }
+  function showSystem() {
+    if (!needLogin) return true;
+    var me = (lastData && lastData.me) || currentUser;
+    if (!me || !me.strict) return true;
+    return !!channelRec("all");
+  }
   function composeLock() {
-    var lock = !selected || selected === "all" || selected.indexOf("g:") === 0;
+    var structural = !selected || selected === "all" || groupLocked();
+    var readonly = needLogin && !channelWrite(selected);
+    var lock = structural || readonly;
     if (content) {
       content.disabled = lock;
-      if (lock) content.placeholder = "Pick a berth";
+      if (structural) content.placeholder = "Pick a berth";
+      else if (readonly) content.placeholder = "Read only";
     }
     var hint = $("compose-hint");
     if (hint) hint.hidden = !lock;
@@ -2377,7 +3041,7 @@ html[data-zhc-theme="light"] #channels::-webkit-scrollbar-thumb { background:#c4
     if (toField) toField.value = selected;
     var label = channelLabel(selected);
     if (head) head.textContent = label;
-    if (content && !(!selected || selected === "all" || selected.indexOf("g:") === 0)) {
+    if (content && selected && selected !== "all" && !groupLocked()) {
       content.placeholder = "Message " + label;
     }
     showPane(selected);
@@ -2397,8 +3061,11 @@ html[data-zhc-theme="light"] #channels::-webkit-scrollbar-thumb { background:#c4
     return id.indexOf("g:") === 0 ? "#" + id.slice(2) : "@" + id;
   }
   function renderChannels(agents) {
-    var html = '<button type="button" class="chan' + (selected === "all" ? " sel" : "")
-      + '" data-id="all"><span class="hash">#</span>system</button>';
+    var html = "";
+    if (showSystem()) {
+      html += '<button type="button" class="chan' + (selected === "all" ? " sel" : "")
+        + '" data-id="all"><span class="hash">#</span>system</button>';
+    }
     var online = 0;
     for (var i = 0; i < agents.length; i++) {
       var a = agents[i];
@@ -2445,7 +3112,8 @@ html[data-zhc-theme="light"] #channels::-webkit-scrollbar-thumb { background:#c4
     var chips = "";
     for (var i = 0; i < files.length; i++) chips += fileChip(files[i]);
     var body = m.content ? '<div class="body">' + renderMd(m.content) + "</div>" : "";
-    return '<div class="msg' + (who === "human" ? " me" : "") + '">'
+    var mine = who === "human" || (currentUser && who === currentUser.id);
+    return '<div class="msg' + (mine ? " me" : "") + '">'
       + '<div class="meta"><span class="who">' + esc(who) + "</span>"
       + '<span class="to">→ ' + esc(dest) + "</span>"
       + '<span class="ts" title="' + esc(m.ts) + '">' + esc(fmtTs(m.ts)) + "</span></div>"
@@ -2532,7 +3200,11 @@ html[data-zhc-theme="light"] #channels::-webkit-scrollbar-thumb { background:#c4
     document.close();
   }
   function denied(r) {
-    if (r && (r.status === 401 || r.status === 403)) { bootOut(r.status); return true; }
+    if (r && (r.status === 401 || r.status === 403)) {
+      if (needLogin) { showLogin(); return true; }
+      bootOut(r.status);
+      return true;
+    }
     return false;
   }
   function loadHistory(chan, exact) {
@@ -2578,7 +3250,7 @@ html[data-zhc-theme="light"] #channels::-webkit-scrollbar-thumb { background:#c4
       var t = m.type || "";
       if (t === "register" || t === "disconnect" || t === "error" || t === "ack") continue;
       var who = m.from || "";
-      if (!who || who === "human") continue;
+      if (!who || who === "human" || (currentUser && who === currentUser.id)) continue;
       var key = String(m.ts || "") + "\n" + String(m.content || "");
       if (!latest[who]) order.push(who);
       latest[who] = key;
@@ -2607,6 +3279,16 @@ html[data-zhc-theme="light"] #channels::-webkit-scrollbar-thumb { background:#c4
     var raw = JSON.stringify(data.agents || []);
     var seq = data.seq || 0;
     lastData = data;
+    if (data.me) currentUser = data.me;
+    if (needLogin && currentUser && currentUser.strict && selected === "all" && !showSystem()) {
+      var nxt = "";
+      var rosterCh = data.channels || [];
+      for (var ci = 0; ci < rosterCh.length; ci++) {
+        if (rosterCh[ci].id && rosterCh[ci].id !== "all") { nxt = rosterCh[ci].id; break; }
+      }
+      if (!nxt && data.agents && data.agents.length) nxt = data.agents[0].id;
+      if (nxt) { selectTarget(nxt, false); return; }
+    }
     if (raw !== lastAgentsRaw || hadHold) {
       lastAgentsRaw = raw;
       var agents = data.agents || [];
@@ -2654,7 +3336,8 @@ html[data-zhc-theme="light"] #channels::-webkit-scrollbar-thumb { background:#c4
   }
   function send(ev) {
     if (ev) ev.preventDefault();
-    if (!selected || selected === "all" || selected.indexOf("g:") === 0) return;
+    if (!selected || selected === "all" || groupLocked()) return;
+    if (needLogin && !channelWrite(selected)) return;
     var text = (content.value || "").replace(/^\s+|\s+$/g, "");
     if (!text && !pendingFiles.length) return;
     var to = selected || "all";
@@ -2763,9 +3446,104 @@ html[data-zhc-theme="light"] #channels::-webkit-scrollbar-thumb { background:#c4
     composeLock();
     tick();
     pollTimer = setInterval(tick, 1500);
+    var open = $("acct-open");
+    if (open && currentUser && currentUser.role === "manager") open.hidden = false;
   }
-  if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", init);
-  else init();
+  function showLogin() {
+    var box = $("login");
+    if (box) box.hidden = false;
+  }
+  function hideLogin() {
+    var box = $("login");
+    if (box) box.hidden = true;
+  }
+  function boot() {
+    var form = $("login-form");
+    if (form) form.addEventListener("submit", function (ev) {
+      ev.preventDefault();
+      var err = $("login-err");
+      fetch("__API__/login", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          user: ($("login-user").value || "").replace(/^\s+|\s+$/g, ""),
+          password: $("login-pass").value || ""
+        })
+      }).then(function (r) { return r.json().then(function (j) { return { status: r.status, body: j }; }); })
+        .then(function (res) {
+          if (res.status === 403) {
+            if (err) err.textContent = "suspended";
+            return;
+          }
+          if (!res.body || !res.body.ok) {
+            if (err) err.textContent = "bad login";
+            return;
+          }
+          currentUser = res.body.user;
+          if (err) err.textContent = "";
+          hideLogin();
+          init();
+        }).catch(function () { if (err) err.textContent = "bad login"; });
+    });
+    var open = $("acct-open");
+    if (open) open.addEventListener("click", function () {
+      var box = $("acct");
+      if (box) box.hidden = false;
+      fetch("__API__/users", { cache: "no-store" }).then(function (r) { return r.json(); }).then(function (j) {
+        var list = $("acct-list");
+        if (list) list.textContent = JSON.stringify((j && j.users) || [], null, 2);
+      }).catch(function () {});
+    });
+    var closeBtn = $("acct-close");
+    if (closeBtn) closeBtn.addEventListener("click", function () {
+      var box = $("acct");
+      if (box) box.hidden = true;
+    });
+    var acct = $("acct-form");
+    if (acct) acct.addEventListener("submit", function (ev) {
+      ev.preventDefault();
+      fetch("__API__/users", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          id: ($("acct-user").value || "").replace(/^\s+|\s+$/g, ""),
+          password: $("acct-pass").value || "",
+          role: $("acct-role").value
+        })
+      }).then(function (r) { return r.json(); }).then(function (j) {
+        var err = $("acct-err");
+        if (err) err.textContent = j && j.ok ? "" : ((j && j.error) || "failed");
+      }).catch(function () {});
+    });
+    var grant = $("acct-grant");
+    if (grant) grant.addEventListener("click", function () {
+      fetch("__API__/grants", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          user: ($("acct-user").value || "").replace(/^\s+|\s+$/g, ""),
+          channel: ($("acct-chan").value || "").replace(/^\s+|\s+$/g, ""),
+          read: $("acct-read").checked,
+          write: $("acct-write").checked
+        })
+      }).then(function (r) { return r.json(); }).then(function (j) {
+        var err = $("acct-err");
+        if (err) err.textContent = j && j.ok ? "" : ((j && j.error) || "failed");
+      }).catch(function () {});
+    });
+    if (!needLogin) { init(); return; }
+    fetch("__API__/me", { cache: "no-store" }).then(function (r) {
+      if (r.status === 401) { showLogin(); return null; }
+      return r.json();
+    }).then(function (me) {
+      if (!me || !me.ok) return;
+      currentUser = me;
+      hideLogin();
+      init();
+    }).catch(function () { showLogin(); });
+  }
+  if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", boot);
+  else boot();
 })();
 </script>
 </body>
@@ -2906,6 +3684,9 @@ sub fcgi_serve_conn {
 # with IO::Socket + fcgi_serve_conn instead.
 $SIG{ALRM} = 'IGNORE';
 $SIG{PIPE} = 'IGNORE';
+# FCGI installs a TERM handler that does not exit. rcctl stop sends TERM.
+$SIG{TERM} = sub { exit 0 };
+$SIG{INT}  = sub { exit 0 };
 
 # FCGI stdin is a unix socket when httpd/slowcgi is in front. A tty or
 # /dev/null makes Accept() block and starves the agent socket — skip it.
@@ -3001,9 +3782,10 @@ while (1) {
             if ($line =~ /"type"\s*:\s*"register"/) {
                 my $obj = eval { decode_json($line) };
                 if ($obj && $obj->{id}) {
-                    bind_registered_agent($fh, $id, $obj->{id}, $$bufref);
-                    $id = $obj->{id};
-                    $bufref = \$agents{$id}{buf} if $agents{$id};
+                    if (bind_registered_agent($fh, $id, $obj->{id}, $$bufref)) {
+                        $id = $obj->{id};
+                        $bufref = \$agents{$id}{buf} if $agents{$id};
+                    }
                     next;
                 }
             }

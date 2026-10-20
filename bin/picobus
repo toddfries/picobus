@@ -727,6 +727,8 @@ sub write_llm_secrets {
         close $mf;
         chmod 0600, "$SECRETS_DIR/llm.json";
     }
+    # Chief is created before this signup, so his home has no key yet.
+    crew_call({ op => 'keys' });
 }
 
 sub save_setup {

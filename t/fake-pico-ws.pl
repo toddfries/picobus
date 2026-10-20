@@ -86,6 +86,21 @@ websocket '/pico/ws' => sub {
         return unless $type eq 'message.send';
         my $content = $hash->{payload}{content} // '';
         my $sid     = $hash->{session_id} // '';
+        append_line('frames.ndjson', $hash);
+        # The one-time introduction is a sentence, not an echo of the prompt.
+        if ($content =~ /one-time introduction/) {
+            $c->send({ json => {
+                type       => 'message.create',
+                session_id => $sid,
+                payload    => { content => 'I expect to keep this crew working.' },
+            } });
+            $c->send({ json => {
+                type       => 'typing.stop',
+                session_id => $sid,
+                payload    => {},
+            } });
+            return;
+        }
         $c->send({ json => {
             type       => 'message.create',
             session_id => $sid,

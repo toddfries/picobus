@@ -322,6 +322,11 @@ sub route_message {
     log_msg($obj);
 
     my $to = $obj->{to} // '';
+    # A mate's one-time introduction is addressed to the human. The web
+    # user is not a hub socket; the line stays in the mate's transcript.
+    if ($to eq 'human') {
+        return;
+    }
     if (is_broadcast_to($to) || $to eq 'all') {
         # System log only. Work is never assigned via to=all unless lab flag.
         if ($HUB_BROADCAST) {

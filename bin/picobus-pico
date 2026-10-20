@@ -86,6 +86,23 @@ $ua->max_redirects(0);
 my $DIR_FILE = $ENV{PICO_DIRECTORY} // '/var/picobus/dir/directory.json';
 my $POLL     = $ENV{PICO_POLL}      // 20;
 my $HUB_LOG  = $ENV{HUB_LOG}        // '/var/picobus/hub-events.ndjson';
+# Flags sit beside the directory file. /var/picobus itself is not writable
+# by _picobus; dir/ is.
+my $GREET_DIR = $ENV{PICO_GREET_DIR} // do {
+    my $d = $DIR_FILE;
+    $d =~ s{/[^/]+\z}{};
+    $d = '.' if $d eq $DIR_FILE;
+    "$d/greet";
+};
+my $GREET_RETRY = $ENV{PICO_GREET_RETRY} // 600;
+$GREET_RETRY = 600 if $GREET_RETRY !~ /^\d+\z/ || $GREET_RETRY < 1;
+my $GREET_TIMEOUT = $ENV{PICO_GREET_TIMEOUT} // 90;
+$GREET_TIMEOUT = 90 if $GREET_TIMEOUT !~ /^\d+\z/ || $GREET_TIMEOUT < 1;
+# The model already has these files in its prompt. Ask once; do not loop.
+my $GREET_PROMPT = 'This is your one-time introduction. '
+    . 'Study IDENTITY.md, SOUL.md, USER.md, AGENT.md, and the skills '
+    . 'already in your workspace. Reply with one sentence about what you '
+    . 'expect to be doing. Do not ask a question.';
 $POLL = 20 if !$POLL || $POLL < 1;
 
 my %cards;
@@ -336,6 +353,95 @@ sub sid_for {
     return "pb.$from";
 }
 
+sub greet_sid {
+    my ($agent) = @_;
+    return 'pb.greet.' . $agent->{id};
+}
+
+sub greet_flag {
+    my ($agent) = @_;
+    return "$GREET_DIR/$agent->{id}";
+}
+
+sub greet_done {
+    my ($agent) = @_;
+    return -f greet_flag($agent);
+}
+
+# A missing key or a parroted prompt is not an introduction.
+sub greet_bad {
+    my ($s) = @_;
+    return 1 if $s =~ /one-time introduction/;
+    return 1 if $s =~ /api[_ ]key|not configured|no model|unauthorized|model not found/i;
+    return 0;
+}
+
+sub greet_clear_timer {
+    my ($agent) = @_;
+    if ($agent->{greet_timer}) {
+        Mojo::IOLoop->remove($agent->{greet_timer});
+        $agent->{greet_timer} = undef;
+    }
+}
+
+sub greet_mark {
+    my ($agent) = @_;
+    mkdir $GREET_DIR, 0750 unless -d $GREET_DIR;
+    my $path = greet_flag($agent);
+    if (open my $fh, '>', $path) {
+        print $fh "1\n";
+        close $fh;
+        chmod 0640, $path;
+        logmsg("$agent->{id} greet recorded");
+        return 1;
+    }
+    logmsg("$agent->{id} greet flag: $!");
+    return 0;
+}
+
+# Failure leaves the flag unset. The next try is one later turn, not a loop.
+sub greet_fail {
+    my ($agent, $why) = @_;
+    return unless $agent->{greet_inflight};
+    $agent->{greet_inflight} = 0;
+    greet_clear_timer($agent);
+    logmsg("$agent->{id} greet not sent ($why)");
+    return if greet_done($agent);
+    return if $agent->{greet_wait};
+    $agent->{greet_wait} = Mojo::IOLoop->timer($GREET_RETRY => sub {
+        $agent->{greet_wait} = undef;
+        maybe_greet($agent);
+    });
+}
+
+sub maybe_greet {
+    my ($agent) = @_;
+    return unless $agent->{hub};
+    return unless $agent->{ws}{ control_sid($agent) };
+    return if greet_done($agent);
+    return if $agent->{greet_inflight};
+    return if $agent->{greet_wait};
+    $agent->{greet_inflight} = 1;
+    my $sid = greet_sid($agent);
+    my $st = $agent->{sessions}{$sid} ||= {};
+    $st->{from}    = 'human';
+    $st->{greet}   = 1;
+    $st->{echo}    = 0;
+    $st->{content} = '';
+    $st->{flushed} = '';
+    pico_send($agent, $sid, {
+        type       => 'message.send',
+        id         => 'pb-greet-' . $agent->{id},
+        session_id => $sid,
+        payload    => { content => $GREET_PROMPT },
+    });
+    greet_clear_timer($agent);
+    $agent->{greet_timer} = Mojo::IOLoop->timer($GREET_TIMEOUT => sub {
+        greet_fail($agent, 'timeout');
+    });
+    logmsg("$agent->{id} greet once");
+}
+
 sub thoughtish {
     my ($pl) = @_;
     return 1 unless $pl && ref $pl eq 'HASH';
@@ -376,6 +482,32 @@ sub flush_session {
     if ($st->{echo}) {
         $st->{flushed} = $content;
         logmsg("$agent->{id} drop echo reply -> " . ($st->{from} // '') . " ($why)");
+        return;
+    }
+    # One introduction. Later chunks of the same turn are not a second hello.
+    if ($st->{greet}) {
+        return if greet_done($agent);
+        unless ($agent->{hub}) {
+            greet_fail($agent, 'hub down');
+            return;
+        }
+        if (greet_bad($content)) {
+            $st->{flushed} = $content;
+            greet_fail($agent, 'model');
+            return;
+        }
+        hub_write($agent, {
+            type    => 'message',
+            from    => $agent->{id},
+            to      => 'human',
+            content => $content,
+        });
+        $st->{flushed} = $content;
+        $agent->{greet_inflight} = 0;
+        greet_clear_timer($agent);
+        # A failed flag write is retried on the next bridge start.
+        greet_mark($agent);
+        logmsg("$agent->{id} greet -> human ($why) bytes=" . length($content));
         return;
     }
     my $to = $st->{from} // '';
@@ -431,6 +563,7 @@ sub handle_pico {
     if ($type eq 'error') {
         my $pl = $msg->{payload} || {};
         logmsg("$agent->{id} pico error: " . ($pl->{message} // $pl->{code} // '?'));
+        greet_fail($agent, 'pico') if $sid ne '' && $sid eq greet_sid($agent);
         return;
     }
     if ($type eq 'typing.stop') {
@@ -531,6 +664,7 @@ sub connect_hub {
             logmsg("$agent->{id} hub error $err");
         });
         logmsg("$agent->{id} registered on hub");
+        maybe_greet($agent);
     });
 }
 
@@ -554,6 +688,7 @@ sub connect_ws {
             logmsg("$agent->{id} pico ws up sid=$sid");
             if ($sid eq control_sid($agent)) {
                 send_directory_frame($agent);
+                maybe_greet($agent);
             }
             while (my $hash = shift @{ $agent->{q}{$sid} || [] }) {
                 $tx->send({ json => $hash });
@@ -567,6 +702,9 @@ sub connect_ws {
                 my ($tx, $code) = @_;
                 logmsg("$agent->{id} ws finished sid=$sid code=" . ($code // ''));
                 delete $agent->{ws}{$sid};
+                if ($sid eq greet_sid($agent)) {
+                    greet_fail($agent, 'ws closed');
+                }
                 if ($agent->{ping}{$sid}) {
                     Mojo::IOLoop->remove($agent->{ping}{$sid});
                     delete $agent->{ping}{$sid};

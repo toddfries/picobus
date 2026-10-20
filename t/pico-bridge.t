@@ -390,6 +390,42 @@ ok($idle, 'bridge forwards idle onto hub state');
 my $hublog = read_text($log);
 ok($hublog !~ /activity/, 'forwarded activity is not a hub log line');
 
+my $greet_line;
+for (1 .. 50) {
+    my $raw = read_text($log);
+    if ($raw =~ /"from":"lab"/ && $raw =~ /"to":"human"/
+        && $raw =~ /I expect to keep this crew working/) {
+        $greet_line = 1;
+        last;
+    }
+    select undef, undef, undef, 0.1;
+}
+ok($greet_line, 'one-off greeting is in the hub log');
+ok(-f "$dir/greet/lab", 'greet flag recorded');
+my $prompts = () = read_text("$statedir/frames.ndjson") =~ /one-time introduction/g;
+ok($prompts == 1, 'introduction prompt sent once');
+my $bridge_err = read_text("$dir/pico.out");
+ok($bridge_err !~ /unknown target human/, 'greeting is not an unknown target');
+
+if ($br_pid) {
+    kill 'TERM', $br_pid;
+    select undef, undef, undef, 0.4;
+    kill 'KILL', $br_pid if kill 0, $br_pid;
+    waitpid($br_pid, 0);
+}
+$br_pid = fork();
+die "fork bridge again: $!" unless defined $br_pid;
+if ($br_pid == 0) {
+    open STDOUT, '>', "$dir/pico2.out";
+    open STDERR, '>&STDOUT';
+    exec $^X, "$FindBin::Bin/../bin/picobus-pico" or exit 127;
+}
+select undef, undef, undef, 1.5;
+my $prompts2 = () = read_text("$statedir/frames.ndjson") =~ /one-time introduction/g;
+ok($prompts2 == 1, 'a second bridge does not greet again');
+my $greet_n = () = read_text($log) =~ /I expect to keep this crew working/g;
+ok($greet_n == 1, 'greeting is not repeated');
+
 if (!$got || !$got_echo || !$echo_quiet || !$dir_ok || !$pid_ok || !$todd_got || $todd_echo || !$think || !$idle) {
     for my $f (qw(pico.out ws.out hub.out hub.ndjson)) {
         next unless -f "$dir/$f";

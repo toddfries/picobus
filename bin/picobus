@@ -2533,7 +2533,7 @@ sub setup_html {
 </div>
 <label for="llm_base">LLM HTTP URL</label>
 <input id="llm_base" name="llm_base" type="url" value="https://openrouter.ai/api/v1">
-<label for="llm_key">CEO API key</label>
+<label for="llm_key">Captain API key</label>
 <input id="llm_key" name="llm_key" type="password" autocomplete="off" required>
 <label for="mgmt_key">OpenRouter management key (optional)</label>
 <input id="mgmt_key" name="mgmt_key" type="password" autocomplete="off">

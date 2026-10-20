@@ -72,6 +72,8 @@ for my $a (@agents) {
     $a->{ws}         = {};      # sid => Mojo::Transaction::WebSocket
     $a->{ws_pending} = {};
     $a->{sessions}   = {};      # sid => { from, content, flushed, echo }
+    $a->{await}      = {};      # mate id => session that asked them
+    $a->{n}          = 0;
     $a->{hbuf}       = '';
 }
 
@@ -512,27 +514,41 @@ sub flush_session {
     }
     my $to = $st->{from} // '';
     return unless length $to;
-    # Another crew member asked. The answer belongs in this mate's chat.
-    # The asker hears the full answer only when they requested it.
     if ($st->{crew}) {
-        hub_write($agent, {
-            type    => 'message',
-            from    => $agent->{id},
-            to      => 'human',
-            content => $content,
-        });
-        if ($st->{report}) {
+        # Work the operator handed across the crew is spoken for the operator.
+        # The mate who passed it on gets a copy only when they asked for one.
+        if ($st->{handoff}) {
             hub_write($agent, {
                 type    => 'message',
                 from    => $agent->{id},
-                to      => $to,
+                to      => 'human',
                 content => $content,
-                echo    => 1,
             });
-            logmsg("$agent->{id} report -> $to ($why) bytes=" . length($content));
+            if ($st->{report}) {
+                hub_write($agent, {
+                    type    => 'message',
+                    from    => $agent->{id},
+                    to      => $to,
+                    content => $content,
+                    echo    => 1,
+                });
+                logmsg("$agent->{id} report -> $to ($why) bytes=" . length($content));
+            }
+            $st->{flushed} = $content;
+            logmsg("$agent->{id} reply -> operator ($why) bytes=" . length($content));
+            return;
         }
+        # A shipmate asked. The answer goes to that shipmate. reply stops
+        # their bridge from opening another round off this answer.
+        hub_write($agent, {
+            type    => 'message',
+            from    => $agent->{id},
+            to      => $to,
+            content => $content,
+            reply   => 1,
+        });
         $st->{flushed} = $content;
-        logmsg("$agent->{id} reply -> human ($why) bytes=" . length($content));
+        logmsg("$agent->{id} reply -> $to ($why) bytes=" . length($content));
         return;
     }
     hub_write($agent, {
@@ -544,6 +560,17 @@ sub flush_session {
     });
     $st->{flushed} = $content;
     logmsg("$agent->{id} reply -> $to ($why) bytes=" . length($content));
+}
+
+sub mate_label {
+    my ($id) = @_;
+    return 'a shipmate' unless defined $id && $id ne '';
+    my $nick = '';
+    if (my $c = $cards{$id}) {
+        $nick = $c->{nick} // '';
+    }
+    return $nick if $nick ne '';
+    return ucfirst $id;
 }
 
 # "tell chief to …" / "ask the chief to …" / "have chief …" / "get chief to …".
@@ -558,15 +585,35 @@ sub delegation_target {
     return $id;
 }
 
-# The other mate hears the work, not the "tell chief to" wrapper.
-# Words before that wrapper ("are you there yet?") are not the work.
-sub delegation_task {
-    my ($mate, $content) = @_;
+# handoff: "tell|ask|have|get <mate> to <work>", and have/get without "to".
+# The worker states the result for the operator.
+# converse: "ask <mate> for|about|what …". The preposition is the question.
+# The other mate receives one sentence and answers the asker.
+# Words before the wrapper ("are you there yet?") are not the work.
+sub delegation_plan {
+    my ($agent, $content) = @_;
+    my $mate = delegation_target($agent, $content);
+    return () unless $mate ne '';
     my $task = $content // '';
-    $task =~ s/^.*?\b(?:tell|ask|have|get)\s+(?:the\s+)?\Q$mate\E\s+(?:to\s+)?//is;
-    $task =~ s/^\s+|\s+$//g;
-    return $content if $task eq '';
-    return $task;
+    return () unless $task =~ /\b(tell|ask|have|get)\s+(?:the\s+)?\Q$mate\E\b\s*(.*)\z/is;
+    my $verb = lc $1;
+    my $rest = $2 // '';
+    $rest =~ s/\A\s+|\s+\z//g;
+    my $infinitive = ($rest =~ s/\Ato\s+//i) ? 1 : 0;
+    $rest =~ s/\A\s+//;
+    return () if $rest eq '';
+    my $kind = ($verb eq 'have' || $verb eq 'get' || $infinitive) ? 'handoff' : 'converse';
+    if ($kind eq 'converse') {
+        my $who = mate_label($agent->{id});
+        my $q = $rest;
+        $q =~ s/[.?!]+\z//;
+        if ($q =~ /\A(?:who|what|when|where|why|how|whether|which)\b/i) {
+            $rest = $q . '?';
+        } else {
+            $rest = "$who asks: $q.";
+        }
+    }
+    return ($kind, $mate, $rest);
 }
 
 sub handle_pico {
@@ -650,6 +697,39 @@ sub handle_hub_line {
     my $content = $obj->{content} // $obj->{body} // '';
     return unless length $content;
     my $sid = sid_for($from);
+    # The answer to a question this mate asked. File it in the session that
+    # asked, and do not open another round. The chat line is already addressed
+    # to this mate.
+    if ($obj->{reply} && is_our_berth($from)) {
+        my $back = delete $agent->{await}{$from};
+        my $dest = (defined $back && $back ne '') ? $back : $sid;
+        my $w = $agent->{sessions}{$dest} ||= {};
+        if ($agent->{idle}{$dest}) {
+            Mojo::IOLoop->remove($agent->{idle}{$dest});
+            delete $agent->{idle}{$dest};
+        }
+        $w->{echo}    = 1;
+        $w->{greet}   = 0;
+        $w->{crew}    = 0;
+        $w->{handoff} = 0;
+        $w->{report}  = 0;
+        $w->{content} = '';
+        $w->{flushed} = '';
+        my $who = mate_label($from);
+        pico_send($agent, $dest, {
+            type       => 'message.send',
+            id         => 'pb-' . $agent->{id} . '-' . ++$agent->{n},
+            session_id => $dest,
+            payload    => {
+                content => "[bus from=$from] $who answered you. "
+                    . "Keep this for your next order. "
+                    . "Do not send a reply to this line.\n\n"
+                    . $content,
+            },
+        });
+        logmsg("$agent->{id} heard $from bytes=" . length($content));
+        return;
+    }
     my $st = $agent->{sessions}{$sid} ||= {};
     if ($agent->{idle}{$sid}) {
         Mojo::IOLoop->remove($agent->{idle}{$sid});
@@ -661,38 +741,58 @@ sub handle_hub_line {
     $st->{echo}    = $obj->{echo} ? 1 : 0;
     $st->{content} = '';
     $st->{flushed} = '';
+    $st->{greet}   = 0;
     $st->{crew}    = is_our_berth($from) ? 1 : 0;
-    $st->{report}  = ($st->{crew} && $content =~ /report the answer back/i) ? 1 : 0;
+    $st->{handoff} = ($st->{crew} && $obj->{handoff}) ? 1 : 0;
+    $st->{report}  = ($st->{handoff} && $content =~ /report the answer back/i) ? 1 : 0;
     my $spoken = $content;
     if ($st->{crew}) {
-        $spoken = "Another crew member asked you this. "
-            . "State what they asked and your answer. "
-            . "This reply is your own statement. "
-            . ($st->{report}
-                ? "They asked you to report the answer back, so include the full answer. "
-                : "Do not address the reply to them. ")
-            . "Name the work, not a program.\n\n"
-            . $content;
+        my $who = mate_label($from);
+        if ($st->{handoff}) {
+            $spoken = "$who passed on work from the operator. "
+                . "State what was asked and your answer for the operator. "
+                . "This reply is for the operator. "
+                . ($st->{report}
+                    ? "They asked you to report the answer back, so include the full answer. "
+                    : "Do not address the reply to $who. ")
+                . "Name the work, not a program.\n\n"
+                . $content;
+        } else {
+            $spoken = "$who asked you this. Answer $who, by name, as a shipmate. "
+                . "This reply is for $who. "
+                . "Name the work, not a program.\n\n"
+                . $content;
+        }
     }
-    elsif (my $mate = delegation_target($agent, $content)) {
-        my $task = delegation_task($mate, $content);
-        if ($content =~ /\b(?:tell me|let me know|report back|bring me|want the answer)\b/i
+    elsif (my ($kind, $mate, $task) = delegation_plan($agent, $content)) {
+        if ($kind eq 'handoff'
+            && $content =~ /\b(?:tell me|let me know|report back|bring me|want the answer)\b/i
             && $task !~ /report the answer back/i) {
             $task .= "\nReport the answer back.";
         }
-        hub_write($agent, {
+        my $out = {
             type    => 'message',
             from    => $agent->{id},
             to      => $mate,
             content => $task,
-        });
-        logmsg("$agent->{id} pass to $mate bytes=" . length($task));
-        # This mate only confirms the handoff. The result is spoken next door.
-        $spoken = "The user asked you to have $mate do this. "
-            . "Reply with one short sentence that you asked them. "
-            . "Do not quote an answer. Do not invent a result. "
-            . "They state the result in their own chat.\n\n"
-            . $task;
+        };
+        $out->{handoff} = 1 if $kind eq 'handoff';
+        hub_write($agent, $out);
+        logmsg("$agent->{id} pass to $mate $kind bytes=" . length($task));
+        my $who = mate_label($mate);
+        if ($kind eq 'converse') {
+            $agent->{await}{$mate} = $sid;
+            $spoken = "You asked $who a question. "
+                . "Reply with one short sentence that you asked them. "
+                . "They will answer you. Do not invent their answer.\n\n"
+                . $task;
+        } else {
+            $spoken = "The operator asked you to have $who do this. "
+                . "Reply with one short sentence that you asked them. "
+                . "Do not quote an answer. Do not invent a result. "
+                . "They state the result in their own chat.\n\n"
+                . $task;
+        }
     }
     # Pico binds the WS connection to ?session_id=; replies go only to
     # connections in that session. Message session_id must match.

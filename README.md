@@ -112,4 +112,5 @@ Signup (`/api/setup`, ALTCHA, account page) writes the LLM key into
 set `PICOBUS_LLM_ALIAS` to use another name.
 
 Tests: `perl t/hub-protocol.t`, `perl t/hub-pledge.t`,
-`perl t/hub-acl.t`, `perl t/pico-bridge.t` (needs Mojolicious).
+`perl t/hub-acl.t`, `perl t/hub-operator.t`, `perl t/pico-bridge.t`
+(needs Mojolicious).

@@ -452,40 +452,43 @@ sub saw_msg {
     return 0;
 }
 sub hub_send {
-    my ($from, $to, $content) = @_;
+    my ($from, $to, $content, $extra) = @_;
     my $c = connect_hub();
     print $c encode_json({ type => 'register', id => "t-$$-" . int(rand(1000)) }), "\n";
     $c->flush;
     select undef, undef, undef, 0.2;
-    print $c encode_json({
-        type => 'message', from => $from, to => $to, content => $content,
-    }), "\n";
+    my $obj = { type => 'message', from => $from, to => $to, content => $content };
+    if ($extra && ref $extra eq 'HASH') {
+        $obj->{$_} = $extra->{$_} for keys %$extra;
+    }
+    print $c encode_json($obj), "\n";
     $c->flush;
     select undef, undef, undef, 0.2;
     close $c;
 }
 
-# mate is a crew id with no gateway. A crew ask is answered in the
-# speaker's chat, not returned to the asker.
+# A shipmate's own words are answered to that shipmate.
+my $crew_mate;
 my $crew_human;
-my $crew_back;
 if ($up) {
     hub_send('mate', 'lab', 'check the disk');
-    $crew_human = wait_msg(sub {
+    $crew_mate = wait_msg(sub {
+        my ($o) = @_;
+        return ($o->{from} // '') eq 'lab'
+            && ($o->{to} // '') eq 'mate'
+            && ($o->{reply} ? 1 : 0)
+            && ($o->{content} // '') =~ /check the disk/
+            && ($o->{content} // '') =~ /shipmate/;
+    });
+    $crew_human = saw_msg(sub {
         my ($o) = @_;
         return ($o->{from} // '') eq 'lab'
             && ($o->{to} // '') eq 'human'
             && ($o->{content} // '') =~ /check the disk/;
     });
-    $crew_back = saw_msg(sub {
-        my ($o) = @_;
-        return ($o->{from} // '') eq 'lab'
-            && ($o->{to} // '') eq 'mate'
-            && ($o->{content} // '') =~ /check the disk/;
-    });
 }
-ok($crew_human, 'crew answer is posted for the human');
-ok(!$crew_back, 'crew answer is not returned to the asker');
+ok($crew_mate, 'a shipmate is answered by name');
+ok(!$crew_human, 'a shipmate answer is not redirected to the operator');
 
 my $passed;
 my $passed_raw;
@@ -505,6 +508,7 @@ if ($up) {
     });
 }
 ok($passed, 'tell mate is passed as the work, not the wrapper');
+ok($passed && $passed->{handoff}, 'tell mate is work for the operator');
 ok(!$passed_raw, 'the tell-mate wrapper is not forwarded');
 
 my $told;
@@ -535,7 +539,7 @@ ok($reported, 'tell me asks the other mate to report the answer back');
 
 my $report_back;
 if ($up && $reported) {
-    hub_send('mate', 'lab', "check memory\nReport the answer back.");
+    hub_send('mate', 'lab', "check memory\nReport the answer back.", { handoff => 1 });
     $report_back = wait_msg(sub {
         my ($o) = @_;
         return ($o->{from} // '') eq 'lab'
@@ -546,7 +550,91 @@ if ($up && $reported) {
 }
 ok($report_back, 'a requested answer is delivered to the asker');
 
-if (!$got || !$got_echo || !$echo_quiet || !$dir_ok || !$pid_ok || !$todd_got || $todd_echo || !$think || !$idle || !$crew_human || $crew_back || !$passed || $passed_raw || !$told || !$reported || !$report_back) {
+# "ask <mate> for …" keeps the question and is not an operator handoff.
+my $asked_for;
+if ($up) {
+    hub_send('smoke5', 'lab', 'ask the mate for a name for the new crew member');
+    $asked_for = wait_msg(sub {
+        my ($o) = @_;
+        return ($o->{from} // '') eq 'lab'
+            && ($o->{to} // '') eq 'mate'
+            && !$o->{handoff}
+            && ($o->{content} // '') =~ /asks: for a name for the new crew member/;
+    });
+}
+ok($asked_for, 'ask-for stays a question for the other mate');
+
+my $asked_to;
+if ($up) {
+    hub_send('smoke6', 'lab', 'ask the mate to check the lamp');
+    $asked_to = wait_msg(sub {
+        my ($o) = @_;
+        return ($o->{from} // '') eq 'lab'
+            && ($o->{to} // '') eq 'mate'
+            && $o->{handoff}
+            && ($o->{content} // '') eq 'check the lamp';
+    });
+}
+ok($asked_to, 'ask-to is work for the operator');
+
+my $had;
+if ($up) {
+    hub_send('smoke7', 'lab', 'have the mate check the bilge');
+    $had = wait_msg(sub {
+        my ($o) = @_;
+        return ($o->{from} // '') eq 'lab'
+            && ($o->{to} // '') eq 'mate'
+            && $o->{handoff}
+            && ($o->{content} // '') eq 'check the bilge';
+    });
+}
+ok($had, 'have-mate keeps the work and marks the handoff');
+
+# Work passed on from the operator is still spoken for the operator.
+my $handoff_op;
+my $handoff_back;
+if ($up) {
+    hub_send('mate', 'lab', 'check the pump', { handoff => 1 });
+    $handoff_op = wait_msg(sub {
+        my ($o) = @_;
+        return ($o->{from} // '') eq 'lab'
+            && ($o->{to} // '') eq 'human'
+            && ($o->{content} // '') =~ /check the pump/
+            && ($o->{content} // '') =~ /operator/;
+    });
+    $handoff_back = saw_msg(sub {
+        my ($o) = @_;
+        return ($o->{from} // '') eq 'lab'
+            && ($o->{to} // '') eq 'mate'
+            && ($o->{content} // '') =~ /check the pump/;
+    });
+}
+ok($handoff_op, 'handed-off work is spoken for the operator');
+ok(!$handoff_back, 'handed-off work is not copied to the passing mate');
+
+# An answer marked reply is shown to the mate and does not bounce.
+my $heard;
+my $bounced_answer;
+if ($up) {
+    hub_send('mate', 'lab', 'navigator-name', { reply => 1 });
+    for (1 .. 30) {
+        if (read_text("$statedir/frames.ndjson") =~ /navigator-name/) {
+            $heard = 1;
+            last;
+        }
+        select undef, undef, undef, 0.1;
+    }
+    select undef, undef, undef, 1.0;
+    $bounced_answer = saw_msg(sub {
+        my ($o) = @_;
+        return ($o->{from} // '') eq 'lab'
+            && ($o->{content} // '') =~ /navigator-name/;
+    });
+}
+ok($heard, 'a shipmate answer is shown to the mate who asked');
+ok(!$bounced_answer, 'a shipmate answer does not start another round');
+
+if (!$got || !$got_echo || !$echo_quiet || !$dir_ok || !$pid_ok || !$todd_got || $todd_echo || !$think || !$idle || !$crew_mate || $crew_human || !$passed || $passed_raw || !$told || !$reported || !$report_back || !$asked_for || !$asked_to || !$had || !$handoff_op || $handoff_back || !$heard || $bounced_answer) {
     for my $f (qw(pico.out ws.out hub.out hub.ndjson)) {
         next unless -f "$dir/$f";
         print "--- $f ---\n";

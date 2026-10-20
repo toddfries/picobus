@@ -224,17 +224,86 @@ $channels{all} = {
 };
 my @log;   # chat history (capped); browser paginates, does not hold all of it
 
-sub load_chat_log {
-    return unless $CHAT_LOG && -f $CHAT_LOG;
-    open my $fh, '<', $CHAT_LOG or return;
+# The signed-in account is the operator. "human" is only the placeholder
+# from before that account exists. Two active accounts and no founder
+# stays unresolved: guessing would attach the crew to the wrong person.
+sub operator_id {
+    my $p = load_principals();
+    return '' unless $p && ref $p eq 'HASH' && keys %$p;
+    my (@founder, @active);
+    for my $id (sort keys %$p) {
+        my $u = $p->{$id};
+        next unless $u && ref $u eq 'HASH';
+        my $st = $u->{status} // 'active';
+        next if $st ne 'active';
+        push @active, $id;
+        push @founder, $id if $u->{founder};
+    }
+    return $founder[0] if @founder;
+    return $active[0] if @active == 1;
+    return '';
+}
+
+sub stamp_operator {
+    my ($obj) = @_;
+    return unless $obj && ref $obj eq 'HASH';
+    my $op = operator_id();
+    return unless $op;
+    for my $k (qw(from to)) {
+        $obj->{$k} = $op if defined $obj->{$k} && $obj->{$k} eq 'human';
+    }
+}
+
+sub addressed_to_operator {
+    my ($to) = @_;
+    return 0 unless defined $to && $to ne '';
+    return 1 if $to eq 'human';
+    my $op = operator_id();
+    return 1 if $op && $to eq $op;
+}
+
+# Past rows stored the placeholder. Rewrite them to the account id so the
+# log and the chat agree. Unparseable lines stay byte for byte.
+sub heal_operator_file {
+    my ($path) = @_;
+    my $op = operator_id();
+    return [] unless $path && -f $path;
+    open my $fh, '<', $path or return [];
+    my (@lines, @objs, $changed);
     while (my $line = <$fh>) {
         chomp $line;
         next unless length $line;
         my $obj = eval { decode_json($line) };
-        next unless $obj && ref $obj eq 'HASH';
-        push @log, $obj;
+        if (!$obj || ref $obj ne 'HASH') {
+            push @lines, $line;
+            next;
+        }
+        if ($op) {
+            for my $k (qw(from to)) {
+                next unless defined $obj->{$k} && $obj->{$k} eq 'human';
+                $obj->{$k} = $op;
+                $changed = 1;
+            }
+        }
+        push @lines, encode_json($obj);
+        push @objs, $obj;
     }
     close $fh;
+    if ($changed) {
+        open my $out, '>', $path or return \@objs;
+        print $out $_, "\n" for @lines;
+        close $out;
+    }
+    return \@objs;
+}
+
+sub load_chat_log {
+    return unless $CHAT_LOG && -f $CHAT_LOG;
+    my $rows = heal_operator_file($CHAT_LOG);
+    if ($HUB_LOG && $HUB_LOG ne $CHAT_LOG && -f $HUB_LOG) {
+        heal_operator_file($HUB_LOG);
+    }
+    push @log, @$rows;
     shift @log while @log > $MAX_LOG;
 }
 
@@ -319,12 +388,13 @@ sub refresh_team_group {
 sub route_message {
     my ($obj) = @_;
     $obj->{to} = normalize_to($obj->{to});
+    stamp_operator($obj);
     log_msg($obj);
 
     my $to = $obj->{to} // '';
-    # A mate's one-time introduction is addressed to the human. The web
-    # user is not a hub socket; the line stays in the mate's transcript.
-    if ($to eq 'human') {
+    # The operator reads the transcript. There is no socket for that account,
+    # so a line addressed there is logged and not delivered.
+    if (addressed_to_operator($to)) {
         return;
     }
     if (is_broadcast_to($to) || $to eq 'all') {

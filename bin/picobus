@@ -133,7 +133,9 @@ sub hub_sandbox {
     }
     if ($PICO_HOME) {
         mkdir $PICO_HOME, 0700 unless -d $PICO_HOME;
-        $dir{$PICO_HOME} = 'rwc';
+        # Skip unveil when the mate home is not there yet. crewd-captain
+        # creates it before this hub is started.
+        $dir{$PICO_HOME} = 'rwc' if -d $PICO_HOME;
     }
     if ($ZHC_GATE) {
         if ($ZHC_SESS_DIR =~ m{\A/} && $ZHC_SESS_DIR !~ m{\.\.} && -d $ZHC_SESS_DIR) {
@@ -200,8 +202,10 @@ chmod 0755, $FILE_DIR if -d $FILE_DIR;
 # Tokens belong in $state/pico, a sibling of this directory.
 mkdir $SECRETS_DIR, 0700 unless -d $SECRETS_DIR;
 chmod 0700, $SECRETS_DIR if -d $SECRETS_DIR;
+# Leave an existing picoclaw home alone. crewd-captain sets it 2750
+# and owned by the gateway user; chmod 0700 would lock that user out
+# of files this process creates on the next signup.
 mkdir $PICO_HOME, 0700 unless -d $PICO_HOME;
-chmod 0700, $PICO_HOME if defined $PICO_HOME && -d $PICO_HOME;
 
 my $sel = IO::Select->new($hub);
 
@@ -619,34 +623,95 @@ sub write_llm_secrets {
     $base ||= 'https://openrouter.ai/api/v1';
     $base =~ s{/+$}{};
     my $alias = $ENV{PICOBUS_LLM_ALIAS} // 'default';
+    my $model = 'nvidia/nemotron-3-ultra-550b-a55b:free';
+    $key =~ s/\\/\\\\/g;
+    $key =~ s/"/\\"/g;
+    $mgmt =~ s/\\/\\\\/g;
+    $mgmt =~ s/"/\\"/g;
+
+    # Keep the pico token. Replacing the whole file used to drop
+    # channel_list, and a symlink into secrets/ is unreadable by the
+    # gateway user (that directory is 0700 root).
+    my $channel = '';
+    my $sec_path = "$PICO_HOME/.security.yml";
+    my $sec_read = $sec_path;
+    if (-l $sec_path) {
+        my $rel = readlink $sec_path;
+        $sec_read = ($rel =~ m{\A/}) ? $rel : "$PICO_HOME/$rel";
+    }
+    for my $cand ($sec_read, "$SECRETS_DIR/security.yml") {
+        next unless defined $cand && -f $cand;
+        open my $old, '<', $cand or next;
+        local $/;
+        my $txt = <$old> // '';
+        close $old;
+        if ($txt =~ /(^channel_list:\n(?:[ \t].*\n)*)/m) {
+            $channel = $1;
+            last;
+        }
+    }
+    my $yaml = "model_list:\n  $alias:\n    api_keys:\n      - \"$key\"\n";
+    $yaml .= "  openrouter-mgmt:\n    api_keys:\n      - \"$mgmt\"\n" if $mgmt ne '';
+    $yaml .= $channel if $channel ne '';
     if (open my $fh, '>', "$SECRETS_DIR/security.yml") {
-        print $fh "model_list:\n  $alias:\n    api_keys:\n      - \"$key\"\n";
-        print $fh "  openrouter-mgmt:\n    api_keys:\n      - \"$mgmt\"\n" if $mgmt;
+        print $fh $yaml;
         close $fh;
         chmod 0600, "$SECRETS_DIR/security.yml";
     }
     mkdir $PICO_HOME, 0700 unless -d $PICO_HOME;
-    my $link = "$PICO_HOME/.security.yml";
-    unlink $link if -l $link || -f $link;
-    symlink "$SECRETS_DIR/security.yml", $link;
-    my $model = 'nvidia/nemotron-3-ultra-550b-a55b:free';
-    if (open my $cf, '>', "$PICO_HOME/config.json") {
-        print $cf encode_json({
+    unlink $sec_path if -l $sec_path;
+    if (open my $pf, '>', $sec_path) {
+        print $pf $yaml;
+        close $pf;
+        chmod 0660, $sec_path;
+    }
+    my $cfg;
+    if (open my $cf, '<', "$PICO_HOME/config.json") {
+        local $/;
+        $cfg = eval { decode_json(<$cf> // '') };
+        close $cf;
+    }
+    if (ref $cfg ne 'HASH') {
+        $cfg = {
             agents => {
                 defaults => {
-                    model_name             => $alias,
-                    workspace              => "$PICO_HOME/workspace",
-                    restrict_to_workspace  => JSON::PP::true,
-                    max_tokens             => 8192,
+                    workspace             => "$PICO_HOME/workspace",
+                    restrict_to_workspace => JSON::PP::true,
+                    max_tokens            => 8192,
                 },
             },
-            model_list => [{
-                name     => $alias,
-                model    => $model,
-                api_base => $base,
-            }],
-        });
-        close $cf;
+        };
+    }
+    $cfg->{agents}{defaults}{model_name} = $alias;
+    $cfg->{agents}{defaults}{workspace} //= "$PICO_HOME/workspace";
+    $cfg->{agents}{defaults}{restrict_to_workspace} = JSON::PP::true;
+    $cfg->{agents}{defaults}{max_tokens} //= 8192;
+    my $list = $cfg->{model_list};
+    $list = [] unless ref $list eq 'ARRAY';
+    my $found = 0;
+    for my $row (@$list) {
+        next unless ref $row eq 'HASH';
+        my $n = $row->{model_name} // $row->{name} // '';
+        next unless $n eq $alias;
+        $row->{model_name} = $alias;
+        delete $row->{name};
+        delete $row->{api_key};
+        delete $row->{api_keys};
+        $row->{model}    ||= $model;
+        $row->{api_base}   = $base;
+        $row->{provider} ||= 'openrouter';
+        $found = 1;
+    }
+    push @$list, {
+        model_name => $alias,
+        provider   => 'openrouter',
+        model      => $model,
+        api_base   => $base,
+    } unless $found;
+    $cfg->{model_list} = $list;
+    if (open my $out, '>', "$PICO_HOME/config.json") {
+        print $out encode_json($cfg);
+        close $out;
     }
     if (open my $mf, '>', "$SECRETS_DIR/llm.json") {
         print $mf encode_json({

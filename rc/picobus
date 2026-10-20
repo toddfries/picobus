@@ -14,7 +14,21 @@ rc_bg=YES
 rc_reload=NO
 
 rc_pre() {
-	mkdir -p /var/run/picoclaw /var/www/run/picoclaw /var/picobus
+	# Captain's home has to exist before the hub unveils PICOCLAW_HOME.
+	if [ -x /usr/local/libexec/crewd-captain ]; then
+		/usr/local/libexec/crewd-captain prepare
+	fi
+	mkdir -p /var/run/picoclaw /var/www/run/picoclaw /var/picobus \
+		/var/www/htdocs/shared
+	# httpd serves /shared/* from its chroot. The hub serves the UI itself.
+	if [ -d /usr/local/share/picobus/shared ]; then
+		cp -f /usr/local/share/picobus/shared/* /var/www/htdocs/shared/ || true
+		chown www:www /var/www/htdocs/shared /var/www/htdocs/shared/* || true
+	fi
+	if [ ! -f /var/www/htdocs/index.html ]; then
+		: > /var/www/htdocs/index.html
+	fi
+	chown www:www /var/www/htdocs/index.html || true
 	[ -x /usr/local/sbin/picobus ]
 }
 

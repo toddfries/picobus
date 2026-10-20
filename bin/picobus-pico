@@ -512,6 +512,29 @@ sub flush_session {
     }
     my $to = $st->{from} // '';
     return unless length $to;
+    # Another crew member asked. The answer belongs in this mate's chat.
+    # The asker hears the full answer only when they requested it.
+    if ($st->{crew}) {
+        hub_write($agent, {
+            type    => 'message',
+            from    => $agent->{id},
+            to      => 'human',
+            content => $content,
+        });
+        if ($st->{report}) {
+            hub_write($agent, {
+                type    => 'message',
+                from    => $agent->{id},
+                to      => $to,
+                content => $content,
+                echo    => 1,
+            });
+            logmsg("$agent->{id} report -> $to ($why) bytes=" . length($content));
+        }
+        $st->{flushed} = $content;
+        logmsg("$agent->{id} reply -> human ($why) bytes=" . length($content));
+        return;
+    }
     hub_write($agent, {
         type    => 'message',
         from    => $agent->{id},
@@ -521,6 +544,28 @@ sub flush_session {
     });
     $st->{flushed} = $content;
     logmsg("$agent->{id} reply -> $to ($why) bytes=" . length($content));
+}
+
+# "tell chief to …" / "ask the chief to …" / "have chief …" / "get chief to …".
+# Returns the other mate's id, or the empty string.
+sub delegation_target {
+    my ($agent, $content) = @_;
+    return '' unless defined $content;
+    return '' unless $content =~ /\b(?:tell|ask|have|get)\s+(?:the\s+)?([A-Za-z][A-Za-z0-9]{0,15})\b/;
+    my $id = lc $1;
+    return '' if $id eq $agent->{id} || $id eq 'me';
+    return '' unless is_our_berth($id);
+    return $id;
+}
+
+# The other mate hears the work, not the "tell chief to" wrapper.
+sub delegation_task {
+    my ($mate, $content) = @_;
+    my $task = $content // '';
+    $task =~ s/\b(?:tell|ask|have|get)\s+(?:the\s+)?\Q$mate\E\s+(?:to\s+)?//i;
+    $task =~ s/^\s+|\s+$//g;
+    return $content if $task eq '';
+    return $task;
 }
 
 sub handle_pico {
@@ -615,13 +660,46 @@ sub handle_hub_line {
     $st->{echo}    = $obj->{echo} ? 1 : 0;
     $st->{content} = '';
     $st->{flushed} = '';
+    $st->{crew}    = is_our_berth($from) ? 1 : 0;
+    $st->{report}  = ($st->{crew} && $content =~ /report the answer back/i) ? 1 : 0;
+    my $spoken = $content;
+    if ($st->{crew}) {
+        $spoken = "Another crew member asked you this. "
+            . "State what they asked and your answer. "
+            . "This reply is your own statement. "
+            . ($st->{report}
+                ? "They asked you to report the answer back, so include the full answer. "
+                : "Do not address the reply to them. ")
+            . "Name the work, not a program.\n\n"
+            . $content;
+    }
+    elsif (my $mate = delegation_target($agent, $content)) {
+        my $task = delegation_task($mate, $content);
+        if ($content =~ /\b(?:tell me|let me know|report back|bring me|want the answer)\b/i
+            && $task !~ /report the answer back/i) {
+            $task .= "\nReport the answer back.";
+        }
+        hub_write($agent, {
+            type    => 'message',
+            from    => $agent->{id},
+            to      => $mate,
+            content => $task,
+        });
+        logmsg("$agent->{id} pass to $mate bytes=" . length($task));
+        # This mate only confirms the handoff. The result is spoken next door.
+        $spoken = "The user asked you to have $mate do this. "
+            . "Reply with one short sentence that you asked them. "
+            . "Do not quote an answer. Do not invent a result. "
+            . "They state the result in their own chat.\n\n"
+            . $task;
+    }
     # Pico binds the WS connection to ?session_id=; replies go only to
     # connections in that session. Message session_id must match.
     pico_send($agent, $sid, {
         type       => 'message.send',
         id         => 'pb-' . $agent->{id} . '-' . ++$agent->{n},
         session_id => $sid,
-        payload    => { content => "[bus from=$from] $content" },
+        payload    => { content => "[bus from=$from] $spoken" },
     });
     logmsg("$agent->{id} inject from=$from sid=$sid bytes=" . length($content));
 }

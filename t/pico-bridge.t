@@ -32,6 +32,9 @@ my $token = 'test-token-pico-bridge';
 open my $tf, '>', "$tokd/lab" or die $!;
 print $tf $token;
 close $tf;
+open my $mf, '>', "$tokd/mate" or die $!;
+print $mf $token;
+close $mf;
 
 my $port;
 for my $p (19100 .. 19220) {
@@ -95,7 +98,7 @@ for (1 .. 40) {
 }
 ok($ws_up, 'fake pico listening');
 
-$ENV{PICO_AGENTS}     = "lab=127.0.0.1:$port";
+$ENV{PICO_AGENTS}     = "lab=127.0.0.1:$port,mate=127.0.0.1:9";
 $ENV{PICO_TOKEN_DIR}  = $tokd;
 $ENV{PICO_IDLE_FLUSH} = 2;
 $ENV{PICO_DIRECTORY}  = "$dir/directory.json";
@@ -426,7 +429,112 @@ ok($prompts2 == 1, 'a second bridge does not greet again');
 my $greet_n = () = read_text($log) =~ /I expect to keep this crew working/g;
 ok($greet_n == 1, 'greeting is not repeated');
 
-if (!$got || !$got_echo || !$echo_quiet || !$dir_ok || !$pid_ok || !$todd_got || $todd_echo || !$think || !$idle) {
+# A reply addressed to the human is logged and not delivered on a socket.
+sub wait_msg {
+    my ($pred) = @_;
+    for (1 .. 40) {
+        for my $line (split /\n/, read_text($log)) {
+            my $o = eval { decode_json($line) } or next;
+            next unless ($o->{type} // '') eq 'message';
+            return $o if $pred->($o);
+        }
+        select undef, undef, undef, 0.2;
+    }
+    return undef;
+}
+sub saw_msg {
+    my ($pred) = @_;
+    for my $line (split /\n/, read_text($log)) {
+        my $o = eval { decode_json($line) } or next;
+        next unless ($o->{type} // '') eq 'message';
+        return 1 if $pred->($o);
+    }
+    return 0;
+}
+sub hub_send {
+    my ($from, $to, $content) = @_;
+    my $c = connect_hub();
+    print $c encode_json({ type => 'register', id => "t-$$-" . int(rand(1000)) }), "\n";
+    $c->flush;
+    select undef, undef, undef, 0.2;
+    print $c encode_json({
+        type => 'message', from => $from, to => $to, content => $content,
+    }), "\n";
+    $c->flush;
+    select undef, undef, undef, 0.2;
+    close $c;
+}
+
+# mate is a crew id with no gateway. A crew ask is answered in the
+# speaker's chat, not returned to the asker.
+my $crew_human;
+my $crew_back;
+if ($up) {
+    hub_send('mate', 'lab', 'check the disk');
+    $crew_human = wait_msg(sub {
+        my ($o) = @_;
+        return ($o->{from} // '') eq 'lab'
+            && ($o->{to} // '') eq 'human'
+            && ($o->{content} // '') =~ /check the disk/;
+    });
+    $crew_back = saw_msg(sub {
+        my ($o) = @_;
+        return ($o->{from} // '') eq 'lab'
+            && ($o->{to} // '') eq 'mate'
+            && ($o->{content} // '') =~ /check the disk/;
+    });
+}
+ok($crew_human, 'crew answer is posted for the human');
+ok(!$crew_back, 'crew answer is not returned to the asker');
+
+my $passed;
+my $passed_raw;
+if ($up) {
+    hub_send('smoke2', 'lab', 'tell mate to check memory');
+    $passed = wait_msg(sub {
+        my ($o) = @_;
+        return ($o->{from} // '') eq 'lab'
+            && ($o->{to} // '') eq 'mate'
+            && ($o->{content} // '') eq 'check memory';
+    });
+    $passed_raw = saw_msg(sub {
+        my ($o) = @_;
+        return ($o->{from} // '') eq 'lab'
+            && ($o->{to} // '') eq 'mate'
+            && ($o->{content} // '') =~ /tell mate to check memory/;
+    });
+}
+ok($passed, 'tell mate is passed as the work, not the wrapper');
+ok(!$passed_raw, 'the tell-mate wrapper is not forwarded');
+
+my $reported;
+if ($up) {
+    hub_send('smoke3', 'lab', 'tell mate to check memory and tell me');
+    $reported = wait_msg(sub {
+        my ($o) = @_;
+        my $body = $o->{content} // '';
+        return ($o->{from} // '') eq 'lab'
+            && ($o->{to} // '') eq 'mate'
+            && $body =~ /check memory/
+            && $body =~ /Report the answer back/;
+    });
+}
+ok($reported, 'tell me asks the other mate to report the answer back');
+
+my $report_back;
+if ($up && $reported) {
+    hub_send('mate', 'lab', "check memory\nReport the answer back.");
+    $report_back = wait_msg(sub {
+        my ($o) = @_;
+        return ($o->{from} // '') eq 'lab'
+            && ($o->{to} // '') eq 'mate'
+            && ($o->{echo} ? 1 : 0)
+            && ($o->{content} // '') =~ /Report the answer back/;
+    });
+}
+ok($report_back, 'a requested answer is delivered to the asker');
+
+if (!$got || !$got_echo || !$echo_quiet || !$dir_ok || !$pid_ok || !$todd_got || $todd_echo || !$think || !$idle || !$crew_human || $crew_back || !$passed || $passed_raw || !$reported || !$report_back) {
     for my $f (qw(pico.out ws.out hub.out hub.ndjson)) {
         next unless -f "$dir/$f";
         print "--- $f ---\n";

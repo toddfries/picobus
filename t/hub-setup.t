@@ -28,9 +28,9 @@ ok($html =~ m{/shared/altcha-http-shim\.js}, 'HTTP shim loaded before widget');
 ok($html =~ m{challengeurl="/api/setup/challenge"}, 'widget challengeurl is /api/setup/challenge');
 ok($html !~ /Solve captcha/i, 'no homemade Solve captcha button');
 ok($html =~ />Continue</, 'Continue CTA like ZHC');
-ok($html =~ /One key for the whole crew/, 'signup offers one shared crew key');
-ok($html =~ /Management key, one key per mate/, 'signup offers a management key per mate');
-ok($html =~ /name="key_mode"/, 'signup key choice is a mode');
+ok($html =~ /Captain API key/, 'signup asks for a captain key');
+ok($html =~ /OpenRouter management key/, 'signup asks for a management key');
+ok($html !~ /name="key_mode"/, 'signup shows both key fields at once');
 
 my $dir  = tempdir(CLEANUP => 1);
 my $hsock = "$dir/hub.sock";
@@ -185,20 +185,40 @@ if ($up) {
         salt      => $chal->{salt},
         signature => $chal->{signature},
     }), '');
+    my $none = fcgi_do('POST', '/api/setup', encode_json({
+        user     => 'todd',
+        password => 'hunter2x',
+        llm_base => 'https://openrouter.ai/api/v1',
+        altcha   => $payload,
+    }));
+    my $nonej = eval { decode_json($none->{body}) } || {};
+    ok(($nonej->{error} // '') =~ /Captain API key or a management key required/,
+        'signup requires a captain key or a management key');
+
     my $both = fcgi_do('POST', '/api/setup', encode_json({
         user     => 'todd',
         password => 'hunter2x',
         llm_base => 'https://openrouter.ai/api/v1',
-        key_mode => 'shared',
         llm_key  => 'sk-or-test',
         mgmt_key => 'mgmt-marker-value',
         altcha   => $payload,
     }));
     my $bothj = eval { decode_json($both->{body}) } || {};
-    ok($both->{ctype} =~ /json/i && !$bothj->{ok}
-        && ($bothj->{error} // '') =~ /Choose one/,
-        'signup rejects a crew key and a management key together')
+    ok($both->{ctype} =~ /json/i && !$bothj->{ok},
+        'both keys do not finish until the other mates are allocated')
         or print "# both body=$both->{body}\n";
+    ok(($bothj->{error} // '') !~ /mgmt-marker-value|sk-or-test/,
+        'both-key failure does not echo either key');
+    my $both_sec = '';
+    if (open my $bs, '<', "$dir/secrets/security.yml") { local $/; $both_sec = <$bs>; close $bs }
+    ok($both_sec =~ /openrouter-mgmt:/ && $both_sec =~ /mgmt-marker-value/
+        && $both_sec =~ /sk-or-test/,
+        'both keys are stored for the crew');
+    my $both_home = '';
+    if (open my $bh, '<', "$dir/pico/.security.yml") { local $/; $both_home = <$bh>; close $bh }
+    ok($both_home =~ /sk-or-test/ && $both_home !~ /openrouter-mgmt:/,
+        'captain home gets the captain key only');
+    ok(!-f "$dir/setup.json", 'unfinished allocation does not complete setup');
 
     my $mgmt = fcgi_do('POST', '/api/setup', encode_json({
         user     => 'todd',
@@ -266,6 +286,11 @@ if ($up) {
     ok(0, 'api 404 not HTML (skipped)');
     ok(0, 'widget JS (skipped)');
     ok(0, 'pow (skipped)');
+    ok(0, 'neither key (skipped)');
+    ok(0, 'both unfinished (skipped)');
+    ok(0, 'both echo (skipped)');
+    ok(0, 'both stored (skipped)');
+    ok(0, 'captain home (skipped)');
     ok(0, 'save JSON (skipped)');
     ok(0, 'save not HTML (skipped)');
     ok(0, 'save ok (skipped)');

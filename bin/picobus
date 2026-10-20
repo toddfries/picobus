@@ -655,14 +655,13 @@ sub write_llm_secrets {
             last;
         }
     }
-    # One crew key is written onto the captain. A management key stays in
-    # the secrets dir; crewd-spawn allocates a separate key per mate.
-    my $yaml;
-    if ($mgmt ne '') {
-        $yaml = "model_list:\n  openrouter-mgmt:\n    api_keys:\n      - \"$mgmt\"\n";
-    } else {
-        $yaml = "model_list:\n  $alias:\n    api_keys:\n      - \"$key\"\n";
-    }
+    # The captain key is written onto the captain. A management key stays
+    # in the secrets dir. With both, the other mates get unique keys.
+    # With only the captain key, crewd-spawn copies it onto mates that
+    # have none.
+    my $yaml = "model_list:\n";
+    $yaml .= "  $alias:\n    api_keys:\n      - \"$key\"\n" if $key ne '';
+    $yaml .= "  openrouter-mgmt:\n    api_keys:\n      - \"$mgmt\"\n" if $mgmt ne '';
     $yaml .= $channel if $channel ne '';
     if (open my $fh, '>', "$SECRETS_DIR/security.yml") {
         print $fh $yaml;
@@ -671,8 +670,10 @@ sub write_llm_secrets {
     }
     mkdir $PICO_HOME, 0700 unless -d $PICO_HOME;
     unlink $sec_path if -l $sec_path;
-    if ($mgmt eq '' && open my $pf, '>', $sec_path) {
-        print $pf $yaml;
+    if ($key ne '' && open my $pf, '>', $sec_path) {
+        my $cap = "model_list:\n  $alias:\n    api_keys:\n      - \"$key\"\n";
+        $cap .= $channel if $channel ne '';
+        print $pf $cap;
         close $pf;
         chmod 0660, $sec_path;
     }
@@ -727,8 +728,8 @@ sub write_llm_secrets {
     if (open my $mf, '>', "$SECRETS_DIR/llm.json") {
         print $mf encode_json({
             api_base     => $base,
-            shared_key   => $mgmt ? JSON::PP::false : JSON::PP::true,
-            has_mgmt_key => $mgmt ? JSON::PP::true : JSON::PP::false,
+            shared_key   => ($key ne '' && $mgmt eq '') ? JSON::PP::true : JSON::PP::false,
+            has_mgmt_key => ($mgmt ne '') ? JSON::PP::true : JSON::PP::false,
         });
         close $mf;
         chmod 0600, "$SECRETS_DIR/llm.json";
@@ -1905,43 +1906,12 @@ sub handle_fcgi {
         my $mgmt = $obj->{mgmt_key} // '';
         $key =~ s/\s+//g;
         $mgmt =~ s/\s+//g;
-        my $mode = $obj->{key_mode} // '';
-        $mode = '' if $mode ne 'shared' && $mode ne 'mgmt';
-        if ($mode eq '') {
-            if ($key ne '' && $mgmt eq '') {
-                $mode = 'shared';
-            } elsif ($mgmt ne '' && $key eq '') {
-                $mode = 'mgmt';
-            } elsif ($key ne '' && $mgmt ne '') {
-                json_out(400, { ok => \0, error => 'Choose one: a crew key, or a management key' });
-                return;
-            }
+        if ($key eq '' && $mgmt eq '') {
+            json_out(400, { ok => \0, error => 'Captain API key or a management key required' });
+            return;
         }
-        if ($mode eq 'shared') {
-            if ($key eq '') {
-                json_out(400, { ok => \0, error => 'Crew API key required' });
-                return;
-            }
-            if ($mgmt ne '') {
-                json_out(400, { ok => \0, error => 'Choose one: a crew key, or a management key' });
-                return;
-            }
-        } elsif ($mode eq 'mgmt') {
-            if ($mgmt eq '') {
-                json_out(400, { ok => \0, error => 'Management key required' });
-                return;
-            }
-            if ($key ne '') {
-                json_out(400, { ok => \0, error => 'Choose one: a crew key, or a management key' });
-                return;
-            }
-            if ($base ne 'https://openrouter.ai/api/v1') {
-                json_out(400, { ok => \0, error => 'A management key allocates OpenRouter keys. Use one crew key for another LLM URL.' });
-                return;
-            }
-            $key = '';
-        } else {
-            json_out(400, { ok => \0, error => 'Crew API key required' });
+        if ($mgmt ne '' && $base ne 'https://openrouter.ai/api/v1') {
+            json_out(400, { ok => \0, error => 'A management key allocates OpenRouter keys. Use a captain key for another LLM URL.' });
             return;
         }
         my $share = write_llm_secrets($base, $key, $mgmt);
@@ -1955,15 +1925,15 @@ sub handle_fcgi {
             pass_hash  => bcrypt_hash($pass),
             created    => strftime('%Y-%m-%dT%H:%M:%SZ', gmtime),
             llm_base   => $base,
-            llm_key    => ($mode eq 'shared') ? \1 : \0,
-            mgmt_key   => ($mode eq 'mgmt') ? \1 : \0,
-            shared_key => ($mode eq 'shared') ? \1 : \0,
+            llm_key    => ($key ne '') ? \1 : \0,
+            mgmt_key   => ($mgmt ne '') ? \1 : \0,
+            shared_key => ($key ne '' && $mgmt eq '') ? \1 : \0,
         });
         if (!$saved) {
             json_out(500, { ok => \0, error => 'could not write setup.json' });
             return;
         }
-        json_out(200, { ok => \1, shared_key => ($mode eq 'shared') ? \1 : \0 });
+        json_out(200, { ok => \1, shared_key => ($key ne '' && $mgmt eq '') ? \1 : \0 });
         return;
     }
 
@@ -2591,20 +2561,16 @@ sub setup_html {
 </div>
 <label for="llm_base">LLM HTTP URL</label>
 <input id="llm_base" name="llm_base" type="url" value="https://openrouter.ai/api/v1">
-<fieldset class="key-choice">
-<label class="choice"><input type="radio" name="key_mode" value="shared" checked> One key for the whole crew</label>
-<p class="hint">Every mate uses this key.</p>
 <div class="key-fields" id="shared-fields">
-<label for="llm_key">Crew API key</label>
+<label for="llm_key">Captain API key</label>
 <input id="llm_key" name="llm_key" type="password" autocomplete="off">
+<p class="hint">Optional if you give a management key. Alone, every mate uses this key.</p>
 </div>
-<label class="choice"><input type="radio" name="key_mode" value="mgmt"> Management key, one key per mate</label>
-<p class="hint">OpenRouter allocates a separate key for each mate. The management key is not given to a mate.</p>
-<div class="key-fields" id="mgmt-fields" hidden>
+<div class="key-fields" id="mgmt-fields">
 <label for="mgmt_key">OpenRouter management key</label>
 <input id="mgmt_key" name="mgmt_key" type="password" autocomplete="off">
+<p class="hint">Optional if you give a captain key. The rest of the crew gets a unique key. This key is not given to a mate.</p>
 </div>
-</fieldset>
 <p id="err" class="err"></p>
 <button type="button" class="btn" id="go">Continue</button>
 </form>
@@ -2622,27 +2588,14 @@ sub setup_html {
     el.addEventListener('verified', function(ev){ p=(ev.detail&&ev.detail.payload)||''; });
     el.addEventListener('statechange', function(ev){ if(ev.detail&&ev.detail.state==='verified'&&ev.detail.payload) p=ev.detail.payload; });
   });
-  function sync(){
-    var picked=document.querySelector('input[name="key_mode"]:checked');
-    var mode=picked?picked.value:'shared';
-    var s=document.getElementById('shared-fields');
-    var m=document.getElementById('mgmt-fields');
-    if(s) s.hidden=mode!=='shared';
-    if(m) m.hidden=mode!=='mgmt';
-  }
-  var radios=document.querySelectorAll('input[name="key_mode"]');
-  for(var i=0;i<radios.length;i++) radios[i].addEventListener('change', sync);
-  sync();
   document.getElementById('go').onclick=function(){
     var err=document.getElementById('err'); err.textContent='';
     if(!payload()){ err.textContent='Complete the human check under your password first.'; return; }
     var f=document.getElementById('f');
-    var picked=document.querySelector('input[name="key_mode"]:checked');
-    var mode=picked?picked.value:'shared';
     var llm=(f.llm_key.value||'').replace(/\s+/g,'');
     var mgmt=(f.mgmt_key.value||'').replace(/\s+/g,'');
-    if(mode==='mgmt'){ if(!mgmt){ err.textContent='Management key required'; return; } llm=''; }
-    else { if(!llm){ err.textContent='Crew API key required'; return; } mgmt=''; mode='shared'; }
+    if(!llm && !mgmt){ err.textContent='Captain API key or a management key required'; return; }
+    var mode=(llm && mgmt)?'both':(mgmt?'mgmt':'shared');
     fetch('/api/setup',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({
       user:f.user.value,password:f.password.value,llm_base:f.llm_base.value,key_mode:mode,llm_key:llm,mgmt_key:mgmt,altcha:payload()
     })}).then(function(r){

@@ -828,6 +828,69 @@ sub valid_user_id {
     return $id && $id =~ /^[a-zA-Z][a-zA-Z0-9._-]{1,31}$/;
 }
 
+sub valid_crew_alias {
+    my ($id) = @_;
+    return $id && $id =~ /^[a-z][a-z0-9]{0,15}$/;
+}
+
+sub crew_rows {
+    my $path = '/var/picobus/crew.tab';
+    my @rows;
+    open my $fh, '<', $path or return \@rows;
+    while (my $line = <$fh>) {
+        chomp $line;
+        my ($alias, $port, $net, $desk, $db) = split ' ', $line;
+        next unless defined $db && valid_crew_alias($alias);
+        push @rows, {
+            alias   => $alias,
+            port    => 0 + $port,
+            network => ($net  eq '1') ? JSON::PP::true : JSON::PP::false,
+            desktop => ($desk eq '1') ? JSON::PP::true : JSON::PP::false,
+            db      => ($db   eq '1') ? JSON::PP::true : JSON::PP::false,
+            dbname  => $alias,
+        };
+    }
+    close $fh;
+    return \@rows;
+}
+
+# The hub is pledged and cannot useradd. crewd-spawn listen runs as root.
+sub crew_call {
+    my ($fields) = @_;
+    my $dir = '/var/picobus/crew-queue';
+    mkdir $dir, 0700 unless -d $dir;
+    my $id = sprintf('%d-%d-%d', time, $$, int(rand(100000)));
+    my $tmp = "$dir/$id.tmp";
+    my $req = "$dir/$id.req";
+    my $res = "$dir/$id.res";
+    open my $fh, '>', $tmp or return { ok => JSON::PP::false, error => 'queue unavailable' };
+    for my $k (sort keys %$fields) {
+        my $v = $fields->{$k} // '';
+        $v =~ s/[\r\n=]//g;
+        print $fh "$k=$v\n";
+    }
+    close $fh;
+    rename $tmp, $req or do {
+        unlink $tmp;
+        return { ok => JSON::PP::false, error => 'queue unavailable' };
+    };
+    for (1 .. 150) {
+        if (-s $res) {
+            open my $rf, '<', $res or last;
+            local $/;
+            my $txt = <$rf> // '';
+            close $rf;
+            unlink $req, $res;
+            my $obj = eval { decode_json($txt) };
+            return $obj if ref $obj eq 'HASH';
+            return { ok => JSON::PP::false, error => 'bad helper reply' };
+        }
+        select undef, undef, undef, 0.2;
+    }
+    unlink $req, $tmp;
+    return { ok => JSON::PP::false, error => 'crew helper timed out' };
+}
+
 sub role_ok {
     my ($role) = @_;
     return $role && ($role eq 'worker' || $role eq 'coworker' || $role eq 'manager');
@@ -1842,7 +1905,7 @@ sub handle_fcgi {
     }
 
     if (!zhc_gate() && $method eq 'POST' && !setup_complete()
-        && $path =~ m{/api/(send|channels|files|login|users|grants)}i) {
+        && $path =~ m{/api/(send|channels|files|login|users|grants|crew)}i) {
         json_out(503, { ok => \0, error => 'setup required' });
         return;
     }
@@ -1871,7 +1934,7 @@ sub handle_fcgi {
 
     my $me;
     my $needs_user = !zhc_gate() && setup_complete()
-        && $path =~ m{^/api/(history|send|files|state|channels|users|grants|me|logout)\b}i;
+        && $path =~ m{^/api/(history|send|files|state|channels|users|grants|crew|me|logout)\b}i;
     if ($needs_user) {
         $me = session_principal();
         if (!$me) {
@@ -2091,6 +2154,57 @@ sub handle_fcgi {
         }
         save_grants($g);
         json_out(200, { ok => \1, grants => $g });
+        return;
+    }
+
+    if (!zhc_gate() && $path =~ m{^/api/crew/?$}i) {
+        if (!$me || ($me->{role} // '') ne 'manager') {
+            json_out(403, { ok => \0, error => 'manager only' });
+            return;
+        }
+        if ($method eq 'GET') {
+            json_out(200, { ok => \1, crew => crew_rows() });
+            return;
+        }
+        if ($method ne 'POST') {
+            json_out(405, { ok => \0, error => 'GET or POST' });
+            return;
+        }
+        my $obj = eval { decode_json($body) } || {};
+        my $id = $obj->{alias} // '';
+        $id =~ s/^\s+|\s+$//g;
+        if (!valid_crew_alias($id)) {
+            json_out(400, { ok => \0, error => 'alias: lowercase letter, then up to 15 letters or digits' });
+            return;
+        }
+        my $ans = crew_call({ op => 'create', alias => $id });
+        json_out($ans->{ok} ? 200 : 400, $ans);
+        return;
+    }
+
+    if (!zhc_gate() && $path =~ m{^/api/crew/([^/]+)/?$}i) {
+        my $id = $1;
+        if (!$me || ($me->{role} // '') ne 'manager') {
+            json_out(403, { ok => \0, error => 'manager only' });
+            return;
+        }
+        if ($method ne 'POST') {
+            json_out(405, { ok => \0, error => 'POST required' });
+            return;
+        }
+        if (!valid_crew_alias($id)) {
+            json_out(400, { ok => \0, error => 'alias: lowercase letter, then up to 15 letters or digits' });
+            return;
+        }
+        my $obj = eval { decode_json($body) } || {};
+        my $ans = crew_call({
+            op      => 'grant',
+            alias   => $id,
+            network => $obj->{network} ? 1 : 0,
+            desktop => $obj->{desktop} ? 1 : 0,
+            db      => $obj->{db}      ? 1 : 0,
+        });
+        json_out($ans->{ok} ? 200 : 400, $ans);
         return;
     }
 
@@ -2711,8 +2825,16 @@ html[data-zhc-theme="light"] #channels::-webkit-scrollbar-thumb { background:#c4
 }
 .login-card button, .acct-card button { margin-right:8px; margin-top:6px; }
 .login-err { color:#ed4245; font-size:13px; min-height:1.2em; }
-.acct-btn { margin:8px 16px; background:var(--sel); color:var(--head);
+.acct-btn { margin:8px 16px 0; background:var(--sel); color:var(--head);
   border:0; border-radius:4px; padding:6px 8px; cursor:pointer; font:inherit; }
+.acct-card { position:relative; }
+.acct-x {
+  position:absolute; top:8px; right:10px; margin:0;
+  background:transparent; color:var(--muted); border:0;
+  font:600 22px/1 system-ui,sans-serif; cursor:pointer;
+}
+.crew-cycle { display:flex; align-items:center; gap:8px; margin:8px 0; }
+.crew-cycle span { flex:1; text-align:center; font-weight:600; }
 </style>
 </head>
 <body>
@@ -2727,7 +2849,8 @@ html[data-zhc-theme="light"] #channels::-webkit-scrollbar-thumb { background:#c4
 </div>
 <div id="acct" class="acct-wrap" hidden>
   <form class="acct-card" id="acct-form">
-    <h2>People</h2>
+    <button type="button" class="acct-x" id="acct-x" aria-label="Close">&times;</button>
+    <h2>Users</h2>
     <input id="acct-user" placeholder="username">
     <input id="acct-pass" type="password" placeholder="initial password">
     <select id="acct-role">
@@ -2747,10 +2870,33 @@ html[data-zhc-theme="light"] #channels::-webkit-scrollbar-thumb { background:#c4
     <pre id="acct-list"></pre>
   </form>
 </div>
+<div id="crew" class="acct-wrap" hidden>
+  <form class="acct-card" id="crew-form">
+    <button type="button" class="acct-x" id="crew-x" aria-label="Close">&times;</button>
+    <h2>Crew</h2>
+    <input id="crew-alias" placeholder="alias (brp)" autocomplete="off">
+    <div>
+      <button type="submit">Create</button>
+    </div>
+    <div class="crew-cycle">
+      <button type="button" id="crew-prev">Prev</button>
+      <span id="crew-name">—</span>
+      <button type="button" id="crew-next">Next</button>
+    </div>
+    <label><input id="crew-net" type="checkbox"> network</label>
+    <label><input id="crew-desk" type="checkbox"> desktop (Xvfb)</label>
+    <label><input id="crew-db" type="checkbox"> database</label>
+    <div>
+      <button type="button" id="crew-save">Save access</button>
+    </div>
+    <p class="login-err" id="crew-err"></p>
+  </form>
+</div>
 <div class="app">
   <aside class="sidebar">
     <div class="brand">__PRODUCT__</div>
-    <button type="button" class="acct-btn" id="acct-open" hidden>People</button>
+    <button type="button" class="acct-btn" id="acct-open" hidden>Users</button>
+    <button type="button" class="acct-btn" id="crew-open" hidden>Crew</button>
     <div class="chan-label">Channels</div>
     <div id="channels">
       <button type="button" class="chan sel" data-id="all"><span class="hash">#</span>broadcast</button>
@@ -3512,7 +3658,11 @@ html[data-zhc-theme="light"] #channels::-webkit-scrollbar-thumb { background:#c4
     tick();
     pollTimer = setInterval(tick, 1500);
     var open = $("acct-open");
-    if (open && currentUser && currentUser.role === "manager") open.hidden = false;
+    var crewOpen = $("crew-open");
+    if (currentUser && currentUser.role === "manager") {
+      if (open) open.hidden = false;
+      if (crewOpen) crewOpen.hidden = false;
+    }
   }
   function showLogin() {
     var box = $("login");
@@ -3559,10 +3709,99 @@ html[data-zhc-theme="light"] #channels::-webkit-scrollbar-thumb { background:#c4
         if (list) list.textContent = JSON.stringify((j && j.users) || [], null, 2);
       }).catch(function () {});
     });
-    var closeBtn = $("acct-close");
-    if (closeBtn) closeBtn.addEventListener("click", function () {
-      var box = $("acct");
+    function hideBox(id) {
+      var box = $(id);
       if (box) box.hidden = true;
+    }
+    var closeBtn = $("acct-close");
+    if (closeBtn) closeBtn.addEventListener("click", function () { hideBox("acct"); });
+    var acctX = $("acct-x");
+    if (acctX) acctX.addEventListener("click", function () { hideBox("acct"); });
+    var crewX = $("crew-x");
+    if (crewX) crewX.addEventListener("click", function () { hideBox("crew"); });
+    document.addEventListener("keydown", function (e) {
+      if (e.key !== "Escape") return;
+      hideBox("acct");
+      hideBox("crew");
+    });
+    var crewList = [];
+    var crewIdx = 0;
+    function showCrewAt() {
+      var name = $("crew-name");
+      var c = crewList[crewIdx];
+      if (!c) {
+        if (name) name.textContent = "—";
+        return;
+      }
+      if (name) name.textContent = c.alias;
+      var net = $("crew-net"), desk = $("crew-desk"), db = $("crew-db");
+      if (net) net.checked = !!c.network;
+      if (desk) desk.checked = !!c.desktop;
+      if (db) db.checked = !!c.db;
+    }
+    function loadCrew(selectAlias) {
+      return fetch("__API__/crew", { cache: "no-store" }).then(function (r) { return r.json(); }).then(function (j) {
+        crewList = (j && j.crew) || [];
+        if (selectAlias) {
+          for (var i = 0; i < crewList.length; i++) {
+            if (crewList[i].alias === selectAlias) crewIdx = i;
+          }
+        }
+        if (crewIdx >= crewList.length) crewIdx = 0;
+        showCrewAt();
+        return j;
+      });
+    }
+    var crewOpen = $("crew-open");
+    if (crewOpen) crewOpen.addEventListener("click", function () {
+      var box = $("crew");
+      if (box) box.hidden = false;
+      var err = $("crew-err");
+      if (err) err.textContent = "";
+      loadCrew().catch(function () { if (err) err.textContent = "could not list crew"; });
+    });
+    var prev = $("crew-prev"), next = $("crew-next");
+    if (prev) prev.addEventListener("click", function () {
+      if (!crewList.length) return;
+      crewIdx = (crewIdx - 1 + crewList.length) % crewList.length;
+      showCrewAt();
+    });
+    if (next) next.addEventListener("click", function () {
+      if (!crewList.length) return;
+      crewIdx = (crewIdx + 1) % crewList.length;
+      showCrewAt();
+    });
+    var crewForm = $("crew-form");
+    if (crewForm) crewForm.addEventListener("submit", function (ev) {
+      ev.preventDefault();
+      var err = $("crew-err");
+      var alias = ($("crew-alias").value || "").replace(/^\s+|\s+$/g, "");
+      fetch("__API__/crew", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ alias: alias })
+      }).then(function (r) { return r.json(); }).then(function (j) {
+        if (err) err.textContent = j && j.ok ? "" : ((j && j.error) || "failed");
+        if (j && j.ok) loadCrew(alias);
+      }).catch(function () { if (err) err.textContent = "failed"; });
+    });
+    var crewSave = $("crew-save");
+    if (crewSave) crewSave.addEventListener("click", function () {
+      var err = $("crew-err");
+      var c = crewList[crewIdx];
+      if (!c) { if (err) err.textContent = "no crew"; return; }
+      fetch("__API__/crew/" + encodeURIComponent(c.alias), {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          network: $("crew-net").checked,
+          desktop: $("crew-desk").checked,
+          db: $("crew-db").checked
+        })
+      }).then(function (r) { return r.json(); }).then(function (j) {
+        if (err) err.textContent = j && j.ok ? "" : ((j && j.error) || "failed");
+        if (j && j.ok) loadCrew(c.alias);
+      }).catch(function () { if (err) err.textContent = "failed"; });
     });
     var acct = $("acct-form");
     if (acct) acct.addEventListener("submit", function (ev) {

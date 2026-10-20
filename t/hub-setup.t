@@ -28,6 +28,9 @@ ok($html =~ m{/shared/altcha-http-shim\.js}, 'HTTP shim loaded before widget');
 ok($html =~ m{challengeurl="/api/setup/challenge"}, 'widget challengeurl is /api/setup/challenge');
 ok($html !~ /Solve captcha/i, 'no homemade Solve captcha button');
 ok($html =~ />Continue</, 'Continue CTA like ZHC');
+ok($html =~ /One key for the whole crew/, 'signup offers one shared crew key');
+ok($html =~ /Management key, one key per mate/, 'signup offers a management key per mate');
+ok($html =~ /name="key_mode"/, 'signup key choice is a mode');
 
 my $dir  = tempdir(CLEANUP => 1);
 my $hsock = "$dir/hub.sock";
@@ -42,6 +45,8 @@ $ENV{SECRETS_DIR}  = "$dir/secrets";
 $ENV{CHAT_LOG}     = "$dir/chat.ndjson";
 $ENV{FILE_DIR}     = "$dir/files";
 $ENV{ROSTER_FILE}  = "$dir/roster.json";
+$ENV{PICOCLAW_HOME} = "$dir/pico";
+mkdir "$dir/pico", 0700;
 $ENV{HUB_NOSANDBOX} = 1;
 delete $ENV{HUB_NOFCGI};
 
@@ -180,6 +185,57 @@ if ($up) {
         salt      => $chal->{salt},
         signature => $chal->{signature},
     }), '');
+    my $both = fcgi_do('POST', '/api/setup', encode_json({
+        user     => 'todd',
+        password => 'hunter2x',
+        llm_base => 'https://openrouter.ai/api/v1',
+        key_mode => 'shared',
+        llm_key  => 'sk-or-test',
+        mgmt_key => 'mgmt-marker-value',
+        altcha   => $payload,
+    }));
+    my $bothj = eval { decode_json($both->{body}) } || {};
+    ok($both->{ctype} =~ /json/i && !$bothj->{ok}
+        && ($bothj->{error} // '') =~ /Choose one/,
+        'signup rejects a crew key and a management key together')
+        or print "# both body=$both->{body}\n";
+
+    my $mgmt = fcgi_do('POST', '/api/setup', encode_json({
+        user     => 'todd',
+        password => 'hunter2x',
+        llm_base => 'https://openrouter.ai/api/v1',
+        key_mode => 'mgmt',
+        mgmt_key => 'mgmt-marker-value',
+        altcha   => $payload,
+    }));
+    my $mgmtj = eval { decode_json($mgmt->{body}) } || {};
+    ok($mgmt->{ctype} =~ /json/i && !$mgmtj->{ok},
+        'management signup does not finish without allocation')
+        or print "# mgmt body=$mgmt->{body}\n";
+    ok(($mgmtj->{error} // '') !~ /mgmt-marker-value/,
+        'allocation failure does not echo the management key');
+    my $sec = '';
+    if (open my $sf, '<', "$dir/secrets/security.yml") { local $/; $sec = <$sf>; close $sf }
+    ok($sec =~ /openrouter-mgmt:/ && $sec =~ /mgmt-marker-value/,
+        'management key is stored for the crew');
+    my $home_sec = '';
+    if (open my $hf, '<', "$dir/pico/.security.yml") { local $/; $home_sec = <$hf>; close $hf }
+    ok($home_sec !~ /mgmt-marker-value/,
+        'management key is not written into the mate home');
+    ok(!-f "$dir/setup.json", 'failed allocation does not complete setup');
+
+    my $other = fcgi_do('POST', '/api/setup', encode_json({
+        user     => 'todd',
+        password => 'hunter2x',
+        llm_base => 'https://llm.example/v1',
+        key_mode => 'mgmt',
+        mgmt_key => 'mgmt-marker-value',
+        altcha   => $payload,
+    }));
+    my $otherj = eval { decode_json($other->{body}) } || {};
+    ok(($otherj->{error} // '') =~ /another LLM URL/,
+        'management key is only for OpenRouter');
+
     my $save = fcgi_do('POST', '/api/setup', encode_json({
         user     => 'todd',
         password => 'hunter2x',

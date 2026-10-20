@@ -41,6 +41,10 @@
       color: #555; margin: 0 0 0.5rem; text-transform: none;
     }
     .scavenger .hint { font-size: 0.8rem; color: #666; margin: 0.25rem 0 0.5rem; }
+    fieldset.key-choice { border: 0; margin: 0.6rem 0 0; padding: 0; }
+    label.choice { font-weight: 600; }
+    label.choice input { width: auto; margin-right: 0.35rem; }
+    .key-fields[hidden] { display: none !important; }
     nav.footer-links { font-size: 0.88rem; margin-top: 1.5rem; }
     nav.footer-links a { margin-right: 0.75rem; }
     .zhc-product-section.hidden { display: none !important; }
@@ -77,12 +81,20 @@
         <label for="llm_base">LLM HTTP URL</label>
         <input type="url" id="llm_base" name="llm_base" value="https://openrouter.ai/api/v1">
         <p class="hint">OpenAI-compatible. Default is OpenRouter.</p>
-        <label for="llm_key">Captain API key</label>
-        <input type="password" id="llm_key" name="llm_key" autocomplete="off" required>
-        <p class="hint">Shared with every agent until a management key (or per-agent keys) exists.</p>
-        <label for="mgmt_key">OpenRouter management key (optional)</label>
-        <input type="password" id="mgmt_key" name="mgmt_key" autocomplete="off">
-        <p class="hint">Lets the captain mint a key per agent. Leave empty to share the captain key.</p>
+        <fieldset class="key-choice">
+          <label class="choice"><input type="radio" name="key_mode" value="shared" checked> One key for the whole crew</label>
+          <p class="hint">Every mate uses this key.</p>
+          <div class="key-fields" id="shared-fields">
+            <label for="llm_key">Crew API key</label>
+            <input type="password" id="llm_key" name="llm_key" autocomplete="off">
+          </div>
+          <label class="choice"><input type="radio" name="key_mode" value="mgmt"> Management key, one key per mate</label>
+          <p class="hint">OpenRouter allocates a separate key for each mate. The management key is not given to a mate.</p>
+          <div class="key-fields" id="mgmt-fields" hidden>
+            <label for="mgmt_key">OpenRouter management key</label>
+            <input type="password" id="mgmt_key" name="mgmt_key" autocomplete="off">
+          </div>
+        </fieldset>
       </div>
 
       <button type="button" class="btn" id="btn-continue" disabled>Continue</button>
@@ -174,11 +186,37 @@
   if ($('nav-dashboard')) $('nav-dashboard').onclick = function () { showAuthSection('dashboard'); };
   if ($('nav-account')) $('nav-account').onclick = function () { showAuthSection('account'); };
 
+  function keyMode() {
+    var picked = document.querySelector('input[name="key_mode"]:checked');
+    return picked ? picked.value : 'shared';
+  }
+  function syncKeyMode() {
+    var mode = keyMode();
+    var shared = $('shared-fields');
+    var mgmt = $('mgmt-fields');
+    if (shared) shared.hidden = mode !== 'shared';
+    if (mgmt) mgmt.hidden = mode !== 'mgmt';
+  }
+  var modes = document.querySelectorAll('input[name="key_mode"]');
+  for (var i = 0; i < modes.length; i++) modes[i].addEventListener('change', syncKeyMode);
+  syncKeyMode();
+
   $('btn-continue').onclick = function () {
     showErr('');
     if (!altchaResponse()) {
       showErr('Complete the human check under your password first.');
       return;
+    }
+    var mode = keyMode();
+    var llm = ($('llm_key').value || '').replace(/\s+/g, '');
+    var mgmt = ($('mgmt_key').value || '').replace(/\s+/g, '');
+    if (mode === 'mgmt') {
+      if (!mgmt) { showErr('Management key required'); return; }
+      llm = '';
+    } else {
+      if (!llm) { showErr('Crew API key required'); return; }
+      mgmt = '';
+      mode = 'shared';
     }
     var btn = $('btn-continue');
     btn.disabled = true;
@@ -186,8 +224,9 @@
       user: $('auth-user').value,
       password: $('auth-password').value,
       llm_base: $('llm_base').value,
-      llm_key: $('llm_key').value,
-      mgmt_key: $('mgmt_key').value,
+      key_mode: mode,
+      llm_key: llm,
+      mgmt_key: mgmt,
       altcha: altchaResponse()
     };
     fetch('/api/setup', {

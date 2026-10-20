@@ -36,7 +36,7 @@ polls) to talk to its neighbours. The Pico path *is* the turn.
 
 ```sh
 # /etc/picobus.conf
-# HUB_GROUP=picobus
+# HUB_GROUP=_picobus
 # PICO_AGENTS=worker=127.0.0.1:18790
 # PICO_TOKEN_DIR=/var/picobus/pico
 rcctl enable picobus picobus_pico
@@ -45,7 +45,7 @@ rcctl start picobus picobus_pico
 
 `picobus-pico` polls `GET /health`, `GET /ready`, and `GET /beacon`
 (no model turn) and writes `/var/picobus/dir/directory.json`. That
-directory is `0750 _picobus:picobus` because `/var/picobus` itself is
+directory is `0750 _picobus:_picobus` because `/var/picobus` itself is
 not writable by the daemon (secrets live next to it). A `directory`
 frame is pushed on the control socket `pb.<id>` only when id, nick, or
 role changes. Pid and uptime changes do not push. A gateway `bus.send`

@@ -82,7 +82,7 @@ $ua->inactivity_timeout(90);
 $ua->max_redirects(0);
 
 # Card file lives under dir/, not the state root. /var/picobus is root-owned
-# and not writable by _picobus; secrets sit beside it. dir/ is 0750 _picobus:picobus.
+# and not writable by _picobus; secrets sit beside it. dir/ is 0750 _picobus:_picobus.
 my $DIR_FILE = $ENV{PICO_DIRECTORY} // '/var/picobus/dir/directory.json';
 my $POLL     = $ENV{PICO_POLL}      // 20;
 my $HUB_LOG  = $ENV{HUB_LOG}        // '/var/picobus/hub-events.ndjson';
@@ -142,7 +142,7 @@ sub save_directory {
         close $fh;
         if (rename $tmp, $DIR_FILE) {
             chmod 0640, $DIR_FILE;
-            if (my $gid = getgrnam('picobus')) {
+            if (my $gid = getgrnam('_picobus')) {
                 chown -1, $gid, $DIR_FILE;
             }
         }

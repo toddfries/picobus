@@ -551,7 +551,7 @@ sub flush_session {
 sub delegation_target {
     my ($agent, $content) = @_;
     return '' unless defined $content;
-    return '' unless $content =~ /\b(?:tell|ask|have|get)\s+(?:the\s+)?([A-Za-z][A-Za-z0-9]{0,15})\b/;
+    return '' unless $content =~ /\b(?:tell|ask|have|get)\s+(?:the\s+)?([A-Za-z][A-Za-z0-9]{0,15})\b/i;
     my $id = lc $1;
     return '' if $id eq $agent->{id} || $id eq 'me';
     return '' unless is_our_berth($id);
@@ -559,10 +559,11 @@ sub delegation_target {
 }
 
 # The other mate hears the work, not the "tell chief to" wrapper.
+# Words before that wrapper ("are you there yet?") are not the work.
 sub delegation_task {
     my ($mate, $content) = @_;
     my $task = $content // '';
-    $task =~ s/\b(?:tell|ask|have|get)\s+(?:the\s+)?\Q$mate\E\s+(?:to\s+)?//i;
+    $task =~ s/^.*?\b(?:tell|ask|have|get)\s+(?:the\s+)?\Q$mate\E\s+(?:to\s+)?//is;
     $task =~ s/^\s+|\s+$//g;
     return $content if $task eq '';
     return $task;

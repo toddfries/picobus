@@ -507,6 +507,18 @@ if ($up) {
 ok($passed, 'tell mate is passed as the work, not the wrapper');
 ok(!$passed_raw, 'the tell-mate wrapper is not forwarded');
 
+my $told;
+if ($up) {
+    hub_send('smoke4', 'lab', 'are you there yet? Tell Mate to say hi');
+    $told = wait_msg(sub {
+        my ($o) = @_;
+        return ($o->{from} // '') eq 'lab'
+            && ($o->{to} // '') eq 'mate'
+            && ($o->{content} // '') eq 'say hi';
+    });
+}
+ok($told, 'Tell Mate with capitals is passed as the work');
+
 my $reported;
 if ($up) {
     hub_send('smoke3', 'lab', 'tell mate to check memory and tell me');
@@ -534,7 +546,7 @@ if ($up && $reported) {
 }
 ok($report_back, 'a requested answer is delivered to the asker');
 
-if (!$got || !$got_echo || !$echo_quiet || !$dir_ok || !$pid_ok || !$todd_got || $todd_echo || !$think || !$idle || !$crew_human || $crew_back || !$passed || $passed_raw || !$reported || !$report_back) {
+if (!$got || !$got_echo || !$echo_quiet || !$dir_ok || !$pid_ok || !$todd_got || $todd_echo || !$think || !$idle || !$crew_human || $crew_back || !$passed || $passed_raw || !$told || !$reported || !$report_back) {
     for my $f (qw(pico.out ws.out hub.out hub.ndjson)) {
         next unless -f "$dir/$f";
         print "--- $f ---\n";

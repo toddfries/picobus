@@ -26,6 +26,7 @@ if (open my $sf, '<', $bin) {
 ok($src =~ /setInterval\(tick, 1500\)/, 'roster poll stays at 1.5s');
 ok($src =~ /dot-spin/ && $src =~ /prefers-reduced-motion/, 'thinking ball is CSS, and reduced motion is static');
 ok($src =~ /dot\.thinking::before/ && $src =~ /dot-spin-back/, 'thinking is a blue ball with a turning ring');
+ok($src =~ /rotate\(360deg\)/ && $src =~ /rotate\(-360deg\)/, 'each ring completes one turn');
 ok($src =~ /selectTarget\("captain"/, 'a fresh visit opens the captain channel');
 ok($src =~ /a message from /, 'a mate-to-mate line collapses to a mention');
 ok($src =~ /data-zhc-bucket/ && $src =~ /html\[data-zhc-bucket="dev"\] \.dot/ && $src =~ /calc\(10px \* 1\.75\)/, 'dev ball is 75% larger; other buckets stay 10px');

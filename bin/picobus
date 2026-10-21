@@ -158,6 +158,14 @@ sub hub_sandbox {
             die "ZHC account db unavailable\n";
         }
     }
+    # crew-queue is a directory under the state dir. Unveil is not recursive.
+    {
+        my $q = crew_queue_dir();
+        if ($q =~ m{\A/} && $q !~ m{\.\.} && !exists $dir{$q}) {
+            mkdir $q, 0700 unless -d $q;
+            $dir{$q} = 'rwc' if -d $q;
+        }
+    }
     for my $d (sort keys %dir) {
         unveil($d, $dir{$d}) or die "unveil $d: $!\n";
     }
@@ -447,8 +455,114 @@ sub handle_agent_line {
         note_activity($id, $obj->{activity} // '');
         return;
     }
+    # The chief's bridge files this. The connection id is the authority.
+    # The model's chat line is not posted; the helper's result is.
+    if (($obj->{type} // '') eq 'roster') {
+        handle_roster($id, $obj);
+        return;
+    }
     $obj->{from} //= $id;
     route_message($obj);
+}
+
+# What the operator hears after a roster filing. The account is aboard only
+# when the helper said so. No program names.
+sub roster_words {
+    my ($op, $alias, $work, $ans) = @_;
+    $work = '' unless defined $work;
+    $work =~ s/[\r\n\x00-\x1f"\\\[\]|]+/ /g;
+    $work =~ s/\s+/ /g;
+    $work =~ s/^\s+|\s+$//g;
+    $work = substr($work, 0, 80);
+    my $job = $work ne '' ? " ($work)" : '';
+    my $asked = $op eq 'remove' ? "remove $alias" : "add $alias$job";
+    if ($op eq 'remove' && $alias eq 'captain') {
+        return 'The captain stays.';
+    }
+    if ($op eq 'remove' && $alias eq 'chief') {
+        return 'The chief stays.';
+    }
+    my $ok = $ans && ref $ans eq 'HASH' && $ans->{ok};
+    if ($ok) {
+        return "I was asked to $asked. The account is gone." if $op eq 'remove';
+        return "I was asked to $asked. The account exists.";
+    }
+    my $err = ($ans && ref $ans eq 'HASH') ? ($ans->{error} // '') : '';
+    $err = 'the roster did not answer' if $err eq '' || $err =~ /Bearer|sk-or-|api_key/i;
+    $err =~ s/crewd-spawn/the roster/g;
+    $err =~ s/\bXvfb\b/a desktop/g;
+    return 'The captain stays.' if $err eq 'the captain stays';
+    return 'The chief stays.' if $err eq 'the chief stays';
+    return "I was asked to $asked. The account already exists." if $err eq 'crew exists';
+    return "I was asked to add $alias. That name is reserved." if $err eq 'reserved name';
+    return "I was asked to remove $alias. Remove is not granted." if $err eq 'remove is not granted';
+    return "I was asked to remove $alias. There is no such account." if $err eq 'no such crew';
+    return "I was asked to $asked. They are still aboard. $err." if $op eq 'remove';
+    return "I was asked to $asked. They are not aboard. $err.";
+}
+
+sub roster_target {
+    my ($to) = @_;
+    $to = '' unless defined $to;
+    $to =~ s/^\s+|\s+$//g;
+    return 'human' if $to eq '' || $to eq 'human';
+    return $to if $to =~ /^[A-Za-z][A-Za-z0-9._-]{0,31}$/;
+    return 'human';
+}
+
+sub emit_roster_result {
+    my ($id, $obj, $text) = @_;
+    my $to = roster_target($obj->{to});
+    my $crew = $obj->{crew} ? 1 : 0;
+    my $handoff = $obj->{handoff} ? 1 : 0;
+    my $report = $obj->{report} ? 1 : 0;
+    if ($crew && $handoff) {
+        route_message({
+            type => 'message', from => $id, to => 'human', content => $text,
+        });
+        if ($report && $to ne 'human') {
+            route_message({
+                type => 'message', from => $id, to => $to,
+                content => $text, echo => 1,
+            });
+        }
+        return;
+    }
+    if ($crew) {
+        route_message({
+            type => 'message', from => $id, to => $to,
+            content => $text, reply => 1,
+        });
+        return;
+    }
+    route_message({
+        type => 'message', from => $id, to => $to,
+        content => $text, echo => 1,
+    });
+}
+
+sub handle_roster {
+    my ($id, $obj) = @_;
+    return unless $id && $id eq 'chief';
+    my $op = lc($obj->{op} // '');
+    my $alias = lc($obj->{alias} // '');
+    return unless $op eq 'add' || $op eq 'remove';
+    return unless valid_crew_alias($alias);
+    my $work = $obj->{work} // '';
+    my $ans;
+    if ($op eq 'remove' && ($alias eq 'captain' || $alias eq 'chief')) {
+        $ans = {
+            ok    => JSON::PP::false,
+            error => $alias eq 'captain' ? 'the captain stays' : 'the chief stays',
+        };
+    }
+    elsif ($op eq 'add' && $alias =~ /^(?:captain|chief|picobus|crewd|root|www)$/) {
+        $ans = { ok => JSON::PP::false, error => 'reserved name' };
+    }
+    else {
+        $ans = crew_call({ op => $op eq 'remove' ? 'remove' : 'create', alias => $alias, by => 'chief' });
+    }
+    emit_roster_result($id, $obj, roster_words($op, $alias, $work, $ans));
 }
 
 sub note_activity {
@@ -948,10 +1062,20 @@ sub crew_rows {
     return \@rows;
 }
 
+# Tests point this at a directory the hub is allowed to write. Production
+# leaves it unset. A relative path or a .. segment is ignored.
+sub crew_queue_dir {
+    my $dir = $ENV{CREW_QUEUE} // '';
+    if ($dir =~ m{\A/} && $dir !~ m{\.\.} && $dir =~ m{\A[-A-Za-z0-9_./]+\z} && length($dir) < 200) {
+        return $dir;
+    }
+    return '/var/picobus/crew-queue';
+}
+
 # The hub is pledged and cannot useradd. crewd-spawn listen runs as root.
 sub crew_call {
     my ($fields) = @_;
-    my $dir = '/var/picobus/crew-queue';
+    my $dir = crew_queue_dir();
     mkdir $dir, 0700 unless -d $dir;
     my $id = sprintf('%d-%d-%d', time, $$, int(rand(100000)));
     my $tmp = "$dir/$id.tmp";
@@ -968,7 +1092,8 @@ sub crew_call {
         unlink $tmp;
         return { ok => JSON::PP::false, error => 'queue unavailable' };
     };
-    for (1 .. 150) {
+    # useradd plus a key allocation can run past a short poll.
+    for (1 .. 450) {
         if (-s $res) {
             open my $rf, '<', $res or last;
             local $/;

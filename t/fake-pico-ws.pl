@@ -88,6 +88,35 @@ websocket '/pico/ws' => sub {
         my $sid     = $hash->{session_id} // '';
         append_line('frames.ndjson', $hash);
         # The one-time introduction is a sentence, not an echo of the prompt.
+        my $roster_reply = '';
+        if ($content =~ /FILE-ROSTER-CAPTAIN/) {
+            $roster_reply = '[[roster add captain]]';
+        }
+        elsif ($content =~ /FILE-ROSTER-CHIEF-OFF/) {
+            $roster_reply = '[[roster remove chief]]';
+        }
+        elsif ($content =~ /FILE-ROSTER-FAIL/) {
+            $roster_reply = '[[roster add brp]]';
+        }
+        elsif ($content =~ /FILE-ROSTER-REMOVE/) {
+            $roster_reply = '[[roster remove brp]]';
+        }
+        elsif ($content =~ /FILE-ROSTER-ADD/) {
+            $roster_reply = '[[roster add brp|business resumption planning]]';
+        }
+        if ($roster_reply ne '') {
+            $c->send({ json => {
+                type       => 'message.create',
+                session_id => $sid,
+                payload    => { content => $roster_reply },
+            } });
+            $c->send({ json => {
+                type       => 'typing.stop',
+                session_id => $sid,
+                payload    => {},
+            } });
+            return;
+        }
         if ($content =~ /one-time introduction/) {
             $c->send({ json => {
                 type       => 'message.create',

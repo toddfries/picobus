@@ -444,6 +444,28 @@ sub maybe_greet {
     logmsg("$agent->{id} greet once");
 }
 
+# [[roster add alias]] or [[roster add alias|the work]] or [[roster remove alias]].
+# The chief files this. Anyone else has the line removed before it is spoken.
+sub roster_marker {
+    my ($text) = @_;
+    return () unless defined $text;
+    return () unless $text =~ /\[\[roster\s+(add|remove)\s+([A-Za-z][A-Za-z0-9]{0,15})(?:\|([^\]\r\n]{0,80}))?\]\]/i;
+    my ($op, $alias, $work) = (lc $1, lc $2, $3 // '');
+    $work =~ s/[\r\n\x00-\x1f"\\\[\]|]+/ /g;
+    $work =~ s/\s+/ /g;
+    $work =~ s/^\s+|\s+$//g;
+    $work = substr($work, 0, 80);
+    return ($op, $alias, $work);
+}
+
+sub strip_roster {
+    my ($text) = @_;
+    return '' unless defined $text;
+    $text =~ s/\[\[roster\s+(?:add|remove)\s+[A-Za-z][A-Za-z0-9]{0,15}(?:\|[^\]\r\n]{0,80})?\]\]//ig;
+    $text =~ s/\A\s+|\s+\z//g;
+    return $text;
+}
+
 sub thoughtish {
     my ($pl) = @_;
     return 1 unless $pl && ref $pl eq 'HASH';
@@ -511,6 +533,39 @@ sub flush_session {
         greet_mark($agent);
         logmsg("$agent->{id} greet -> human ($why) bytes=" . length($content));
         return;
+    }
+    # The roster line files the account. The model's surrounding words are
+    # not what the operator hears; the hub posts the helper's result.
+    my ($rop, $ralias, $rwork) = roster_marker($st->{content});
+    if ($rop) {
+        if (($agent->{id} // '') eq 'chief') {
+            unless ($agent->{hub}) {
+                my $verb = $rop eq 'remove' ? 'remove' : 'add';
+                $st->{content} = "I was asked to $verb $ralias. "
+                    . "The roster did not answer. They are not aboard.";
+            }
+            else {
+                hub_write($agent, {
+                    type    => 'roster',
+                    op      => $rop,
+                    alias   => $ralias,
+                    work    => $rwork,
+                    to      => $st->{from} // '',
+                    crew    => $st->{crew} ? 1 : 0,
+                    handoff => $st->{handoff} ? 1 : 0,
+                    report  => $st->{report} ? 1 : 0,
+                });
+                $st->{flushed} = $st->{content};
+                logmsg("$agent->{id} roster $rop $ralias");
+                return;
+            }
+        }
+        else {
+            $st->{content} = strip_roster($st->{content});
+            return unless length($st->{content} // '');
+        }
+        $content = $st->{content} // '';
+        return unless length $content;
     }
     my $to = $st->{from} // '';
     return unless length $to;
@@ -793,6 +848,12 @@ sub handle_hub_line {
                 . "They state the result in their own chat.\n\n"
                 . $task;
         }
+    }
+    if (($agent->{id} // '') eq 'chief') {
+        $spoken .= "\n\nIf this asks to add or remove a crew member, in any wording, "
+            . "end your reply with the roster line and no other sentence. "
+            . "That line files the account. Words alone do not. "
+            . "A list is not how they join.";
     }
     # Pico binds the WS connection to ?session_id=; replies go only to
     # connections in that session. Message session_id must match.

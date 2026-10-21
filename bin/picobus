@@ -468,6 +468,14 @@ sub handle_agent_line {
         crew_hello($id, $obj);
         return;
     }
+    if (($obj->{type} // '') eq 'message') {
+        my $body = $obj->{content} // '';
+        $body =~ s/^\s+|\s+$//g;
+        my $nfiles = 0;
+        $nfiles = @{ $obj->{files} } if $obj->{files} && ref $obj->{files} eq 'ARRAY';
+        return if $body eq '' && !$nfiles;
+        $obj->{content} = $body;
+    }
     $obj->{from} //= $id;
     route_message($obj);
 }
@@ -541,7 +549,8 @@ sub roster_words {
         return "I was asked to $asked. The account exists.";
     }
     my $err = ($ans && ref $ans eq 'HASH') ? ($ans->{error} // '') : '';
-    $err = 'the roster did not answer' if $err eq '' || $err =~ /Bearer|sk-or-|api_key/i;
+    $err = 'the roster did not answer' if $err eq ''
+        || $err =~ /Bearer|sk-or-|api_key|queue unavailable|crew helper timed out|bad helper reply/i;
     $err =~ s/crewd-spawn/the roster/g;
     $err =~ s/\bXvfb\b/a desktop/g;
     return 'The captain stays.' if $err eq 'the captain stays';
@@ -1092,6 +1101,19 @@ sub valid_user_id {
 sub valid_crew_alias {
     my ($id) = @_;
     return $id && $id =~ /^[a-z][a-z0-9]{0,15}$/;
+}
+
+# A grant is 0 or 1. JSON true and false count. Anything else is refused.
+sub grant_bit {
+    my ($v) = @_;
+    return 0 if !defined $v || $v eq '';
+    if (ref $v) {
+        return -1 unless JSON::PP::is_bool($v);
+        return $v ? 1 : 0;
+    }
+    return 0 if $v eq '0';
+    return 1 if $v eq '1';
+    return -1;
 }
 
 sub crew_rows {
@@ -2420,8 +2442,12 @@ sub handle_fcgi {
             json_out(404, { ok => \0, error => 'no such user' });
             return;
         }
-        my $read = $obj->{read} ? 1 : 0;
-        my $write = $obj->{write} ? 1 : 0;
+        my $read = grant_bit($obj->{read});
+        my $write = grant_bit($obj->{write});
+        if ($read < 0 || $write < 0) {
+            json_out(400, { ok => \0, error => 'grant must be 0 or 1' });
+            return;
+        }
         $read = 1 if $write;
         my $g = load_grants();
         if (!$read && !$write) {

@@ -461,8 +461,61 @@ sub handle_agent_line {
         handle_roster($id, $obj);
         return;
     }
+    # The program that creates a mate asks for one fixed line in that
+    # mate's channel. The connection id is not the mate, so from on a
+    # normal message cannot do this. Any other sentence is refused.
+    if (($obj->{type} // '') eq 'hello') {
+        crew_hello($id, $obj);
+        return;
+    }
     $obj->{from} //= $id;
     route_message($obj);
+}
+
+# uid 0 is crewd-spawn. The hub's own uid is the throwaway test process.
+sub crew_hello {
+    my ($id, $obj) = @_;
+    my $sock = $agents{$id} && $agents{$id}{sock};
+    return unless $sock;
+    my $uid = peer_uid($sock);
+    my $peer_ok = defined $uid && $uid =~ /^\d+\z/ && ($uid == 0 || $uid == $>);
+    my $alias = lc($obj->{alias} // '');
+    my $content = $obj->{content} // '';
+    my $body_ok = $alias =~ /^[a-z][a-z0-9]{0,15}\z/
+        && $content eq 'whats up doc?';
+    unless ($peer_ok && $body_ok) {
+        send_json($sock, { type => 'ack', ok => JSON::PP::false, error => 'hello refused' });
+        return;
+    }
+    if (hello_already($alias)) {
+        send_json($sock, {
+            type    => 'ack',
+            ok      => JSON::PP::true,
+            alias   => $alias,
+            already => JSON::PP::true,
+        });
+        return;
+    }
+    my $line = {
+        type    => 'message',
+        from    => $alias,
+        to      => 'human',
+        content => 'whats up doc?',
+    };
+    stamp_operator($line);
+    ensure_dm_channel($alias);
+    log_msg($line);
+    send_json($sock, { type => 'ack', ok => JSON::PP::true, alias => $alias });
+}
+
+sub hello_already {
+    my ($alias) = @_;
+    for my $m (@log) {
+        next unless ($m->{type} // '') eq 'message';
+        next unless ($m->{from} // '') eq $alias;
+        return 1 if ($m->{content} // '') eq 'whats up doc?';
+    }
+    return 0;
 }
 
 # What the operator hears after a roster filing. The account is aboard only

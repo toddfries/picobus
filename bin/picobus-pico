@@ -100,11 +100,6 @@ my $GREET_RETRY = $ENV{PICO_GREET_RETRY} // 600;
 $GREET_RETRY = 600 if $GREET_RETRY !~ /^\d+\z/ || $GREET_RETRY < 1;
 my $GREET_TIMEOUT = $ENV{PICO_GREET_TIMEOUT} // 90;
 $GREET_TIMEOUT = 90 if $GREET_TIMEOUT !~ /^\d+\z/ || $GREET_TIMEOUT < 1;
-# The model already has these files in its prompt. Ask once; do not loop.
-my $GREET_PROMPT = 'This is your one-time introduction. '
-    . 'Study IDENTITY.md, SOUL.md, USER.md, AGENT.md, and the skills '
-    . 'already in your workspace. Reply with one sentence about what you '
-    . 'expect to be doing. Do not ask a question.';
 $POLL = 20 if !$POLL || $POLL < 1;
 
 my %cards;
@@ -416,34 +411,8 @@ sub greet_fail {
     });
 }
 
-sub maybe_greet {
-    my ($agent) = @_;
-    return unless $agent->{hub};
-    return unless $agent->{ws}{ control_sid($agent) };
-    return if greet_done($agent);
-    return if $agent->{greet_inflight};
-    return if $agent->{greet_wait};
-    $agent->{greet_inflight} = 1;
-    my $sid = greet_sid($agent);
-    my $st = $agent->{sessions}{$sid} ||= {};
-    $st->{from}    = 'human';
-    $st->{greet}   = 1;
-    $st->{echo}    = 0;
-    $st->{content} = '';
-    $st->{flushed} = '';
-    pico_send($agent, $sid, {
-        type       => 'message.send',
-        id         => 'pb-greet-' . $agent->{id},
-        session_id => $sid,
-        payload    => { content => $GREET_PROMPT },
-    });
-    arm_thinking($agent);
-    greet_clear_timer($agent);
-    $agent->{greet_timer} = Mojo::IOLoop->timer($GREET_TIMEOUT => sub {
-        greet_fail($agent, 'timeout');
-    });
-    logmsg("$agent->{id} greet once");
-}
+# The creator posts "whats up doc?" on the hub. Do not ask the model.
+sub maybe_greet { }
 
 # [[roster add alias]] or [[roster add alias|the work]] or [[roster remove alias]].
 # The chief files this. Anyone else has the line removed before it is spoken.

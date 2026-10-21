@@ -412,22 +412,13 @@ ok($type_idle, 'typing.stop clears thinking');
 my $hublog = read_text($log);
 ok($hublog !~ /activity/, 'forwarded activity is not a hub log line');
 
-my $greet_line;
-for (1 .. 50) {
-    my $raw = read_text($log);
-    if ($raw =~ /"from":"lab"/ && $raw =~ /"to":"human"/
-        && $raw =~ /I expect to keep this crew working/) {
-        $greet_line = 1;
-        last;
-    }
-    select undef, undef, undef, 0.1;
-}
-ok($greet_line, 'one-off greeting is in the hub log');
-ok(-f "$dir/greet/lab", 'greet flag recorded');
+# The creator posts the hello. The bridge must not ask the model.
+select undef, undef, undef, 0.6;
 my $prompts = () = read_text("$statedir/frames.ndjson") =~ /one-time introduction/g;
-ok($prompts == 1, 'introduction prompt sent once');
+ok($prompts == 0, 'bridge does not send an introduction prompt');
+ok(!-f "$dir/greet/lab", 'bridge does not record a greet flag');
 my $bridge_err = read_text("$dir/pico.out");
-ok($bridge_err !~ /unknown target human/, 'greeting is not an unknown target');
+ok($bridge_err !~ /unknown target human/, 'bridge does not address human on its own');
 
 if ($br_pid) {
     kill 'TERM', $br_pid;
@@ -444,9 +435,9 @@ if ($br_pid == 0) {
 }
 select undef, undef, undef, 1.5;
 my $prompts2 = () = read_text("$statedir/frames.ndjson") =~ /one-time introduction/g;
-ok($prompts2 == 1, 'a second bridge does not greet again');
-my $greet_n = () = read_text($log) =~ /I expect to keep this crew working/g;
-ok($greet_n == 1, 'greeting is not repeated');
+ok($prompts2 == 0, 'a second bridge still does not ask for an introduction');
+my $greet_n = () = read_text($log) =~ /whats up doc\?/g;
+ok($greet_n == 0, 'the bridge does not invent the hello');
 
 # A reply addressed to the human is logged and not delivered on a socket.
 sub wait_msg {

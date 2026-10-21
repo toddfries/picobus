@@ -4,7 +4,15 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="picobus-cookie" content="__COOKIE__">
+  <meta name="theme-color" content="#313338">
   <title>Create account — __PRODUCT__</title>
+  <link rel="manifest" href="/manifest.webmanifest">
+  <link rel="icon" href="/icon-192.png" type="image/png" sizes="192x192">
+  <script>
+  if ('serviceWorker' in navigator) {
+    navigator.serviceWorker.register('/sw.js').catch(function () {});
+  }
+  </script>
   <script>
   (function () {
     try {
@@ -51,6 +59,7 @@
     <nav class="zhc-product-nav" id="app-nav" aria-label="Main">
       <button type="button" id="nav-dashboard" class="active" data-sec="dashboard">Dashboard</button>
       <button type="button" id="nav-account" data-sec="account">Account</button>
+      <button type="button" id="install" hidden>Install</button>
     </nav>
     <div id="zhc-theme-slot"></div>
   </header>
@@ -110,6 +119,30 @@
   <script src="/shared/altcha-http-shim.js"></script>
   <script src="/shared/altcha-widget-v1.min.js" defer></script>
   <script src="/shared/crew-prefs.js" defer></script>
+  <script>
+var installBtn = document.getElementById('install');
+var deferred = null;
+window.addEventListener('beforeinstallprompt', function (e) {
+  e.preventDefault();
+  deferred = e;
+  if (installBtn) installBtn.hidden = false;
+});
+if (installBtn) {
+  installBtn.addEventListener('click', function () {
+    if (!deferred) return;
+    var pending = deferred;
+    deferred = null;
+    pending.prompt();
+    pending.userChoice.then(function () {
+      installBtn.hidden = true;
+    });
+  });
+}
+window.addEventListener('appinstalled', function () {
+  deferred = null;
+  if (installBtn) installBtn.hidden = true;
+});
+  </script>
   <script>
 (function () {
   var altchaPayload = '';

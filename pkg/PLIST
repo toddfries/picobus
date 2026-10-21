@@ -18,6 +18,8 @@ share/picobus/dc/icons/theme-system.svg
 share/picobus/dc/icons/cookie.svg
 share/picobus/dc/icons/terms.svg
 share/picobus/dc/icons/privacy.svg
+share/picobus/pwa/icon-192.png
+share/picobus/pwa/icon-512.png
 share/examples/picobus/picobus.conf
 @sample ${SYSCONFDIR}/picobus.conf
 share/examples/picobus/httpd.conf

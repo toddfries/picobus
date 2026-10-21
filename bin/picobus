@@ -868,6 +868,98 @@ sub serve_dc_asset {
     return 1;
 }
 
+# Install assets. No session. The worker does not store a response.
+my %PWA_ICON;
+
+sub pwa_manifest {
+    my $name = $PRODUCT;
+    $name = 'picobus' unless defined $name && length $name;
+    $name =~ s/[\x00-\x1f]//g;
+    my $short = $name;
+    $short = substr($short, 0, 12) if length($short) > 12;
+    return encode_json({
+        name             => $name,
+        short_name       => $short,
+        start_url        => '/',
+        scope            => '/',
+        display          => 'standalone',
+        background_color => '#313338',
+        theme_color      => '#313338',
+        icons            => [
+            { src => '/icon-192.png', sizes => '192x192', type => 'image/png', purpose => 'any' },
+            { src => '/icon-512.png', sizes => '512x512', type => 'image/png', purpose => 'any' },
+        ],
+    });
+}
+
+sub pwa_worker {
+    return <<'SW';
+self.addEventListener('install', function () {
+  self.skipWaiting();
+});
+self.addEventListener('activate', function (event) {
+  event.waitUntil(self.clients.claim());
+});
+self.addEventListener('fetch', function (event) {
+  event.respondWith(fetch(event.request));
+});
+SW
+}
+
+sub pwa_icon {
+    my ($name) = @_;
+    return $PWA_ICON{$name} if exists $PWA_ICON{$name};
+    my $bytes;
+    for my $root ($SHARE_DIR, '/usr/local/share/picobus') {
+        next unless defined $root && length $root;
+        my $p = "$root/pwa/$name";
+        my @st = lstat($p);
+        next unless @st;
+        next if -l _;
+        next unless -f _;
+        next if ($st[7] // 0) <= 0 || $st[7] > 1048576;
+        next unless open my $fh, '<:raw', $p;
+        local $/;
+        $bytes = <$fh>;
+        close $fh;
+        last if defined $bytes && length $bytes;
+    }
+    $PWA_ICON{$name} = $bytes;
+    return $bytes;
+}
+
+sub serve_pwa {
+    my ($path, $method) = @_;
+    my $kind = '';
+    $kind = 'manifest' if $path eq '/manifest.webmanifest';
+    $kind = 'worker'   if $path eq '/sw.js';
+    $kind = 'icon192'  if $path eq '/icon-192.png';
+    $kind = 'icon512'  if $path eq '/icon-512.png';
+    return 0 unless $kind;
+    if ($method ne 'GET' && $method ne 'HEAD') {
+        fcgi_print('text/plain; charset=utf-8', "method not allowed\n", '405 Method Not Allowed');
+        return 1;
+    }
+    my ($ct, $body);
+    if ($kind eq 'manifest') {
+        $ct   = 'application/manifest+json';
+        $body = pwa_manifest();
+    } elsif ($kind eq 'worker') {
+        $ct   = 'text/javascript; charset=utf-8';
+        $body = pwa_worker();
+    } else {
+        $ct   = 'image/png';
+        $body = pwa_icon($kind eq 'icon192' ? 'icon-192.png' : 'icon-512.png');
+        if (!defined $body || $body eq '') {
+            fcgi_print('text/plain; charset=utf-8', "not found\n", '404 Not Found');
+            return 1;
+        }
+    }
+    $body = '' if $method eq 'HEAD';
+    fcgi_print($ct, $body);
+    return 1;
+}
+
 sub write_llm_secrets {
     my ($base, $key, $mgmt) = @_;
     mkdir $SECRETS_DIR, 0700 unless -d $SECRETS_DIR;
@@ -2090,6 +2182,9 @@ sub handle_fcgi {
             return;
         }
     }
+    if (serve_pwa($path, $method)) {
+        return;
+    }
     if (defined dc_asset_rel($path)) {
         if ($method ne 'GET' && $method ne 'HEAD') {
             fcgi_print('text/plain; charset=utf-8', "method not allowed\n", '405 Method Not Allowed');
@@ -2817,11 +2912,14 @@ sub setup_html {
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="picobus-cookie" content="__COOKIE__">
+<meta name="theme-color" content="#313338">
 <title>Create account — __PRODUCT__</title>
+<link rel="manifest" href="/manifest.webmanifest">
+<link rel="icon" href="/icon-192.png" type="image/png" sizes="192x192">
 <link rel="stylesheet" href="/shared/zhc-prefs.css">
 </head>
 <body>
-<header class="zhc-app-chrome"><nav class="zhc-product-nav" aria-label="Main"><a href="/">Home</a></nav><div id="zhc-theme-slot"></div></header>
+<header class="zhc-app-chrome"><nav class="zhc-product-nav" aria-label="Main"><a href="/">Home</a></nav><button type="button" id="install" hidden>Install</button><div id="zhc-theme-slot"></div></header>
 <main>
 <h1>Create account</h1>
 <p class="note">Complete ALTCHA under the password, then Continue.</p>
@@ -2852,6 +2950,33 @@ sub setup_html {
 <script src="/shared/altcha-http-shim.js"></script>
 <script src="/shared/altcha-widget-v1.min.js" defer></script>
 <script src="/shared/crew-prefs.js" defer></script>
+<script>
+if ('serviceWorker' in navigator) {
+  navigator.serviceWorker.register('/sw.js').catch(function () {});
+}
+var installBtn = document.getElementById('install');
+var deferred = null;
+window.addEventListener('beforeinstallprompt', function (e) {
+  e.preventDefault();
+  deferred = e;
+  if (installBtn) installBtn.hidden = false;
+});
+if (installBtn) {
+  installBtn.addEventListener('click', function () {
+    if (!deferred) return;
+    var pending = deferred;
+    deferred = null;
+    pending.prompt();
+    pending.userChoice.then(function () {
+      installBtn.hidden = true;
+    });
+  });
+}
+window.addEventListener('appinstalled', function () {
+  deferred = null;
+  if (installBtn) installBtn.hidden = true;
+});
+</script>
 <script>
 (function(){
   var p='';
@@ -2893,7 +3018,15 @@ sub app_html {
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="theme-color" content="#313338">
 <title>__PRODUCT__</title>
+<link rel="manifest" href="/manifest.webmanifest">
+<link rel="icon" href="/icon-192.png" type="image/png" sizes="192x192">
+<script>
+if ('serviceWorker' in navigator) {
+  navigator.serviceWorker.register('/sw.js').catch(function () {});
+}
+</script>
 <script>
 (function () {
   var b = location.pathname.match(/^\/(dev|qa)(\/|$)/);
@@ -3279,6 +3412,7 @@ html[data-zhc-theme="light"] #channels::-webkit-scrollbar-thumb { background:#c4
     <div class="brand">__PRODUCT__</div>
     <button type="button" class="acct-btn" id="acct-open" hidden>Users</button>
     <button type="button" class="acct-btn" id="crew-open" hidden>Crew</button>
+    <button type="button" class="acct-btn" id="install" hidden>Install</button>
     <div class="chan-label">Channels</div>
     <div id="channels">
       <button type="button" class="chan sel" data-id="all"><span class="hash">#</span>broadcast</button>
@@ -3307,6 +3441,30 @@ html[data-zhc-theme="light"] #channels::-webkit-scrollbar-thumb { background:#c4
     </form>
   </section>
 </div>
+<script>
+var installBtn = document.getElementById('install');
+var deferred = null;
+window.addEventListener('beforeinstallprompt', function (e) {
+  e.preventDefault();
+  deferred = e;
+  if (installBtn) installBtn.hidden = false;
+});
+if (installBtn) {
+  installBtn.addEventListener('click', function () {
+    if (!deferred) return;
+    var pending = deferred;
+    deferred = null;
+    pending.prompt();
+    pending.userChoice.then(function () {
+      installBtn.hidden = true;
+    });
+  });
+}
+window.addEventListener('appinstalled', function () {
+  deferred = null;
+  if (installBtn) installBtn.hidden = true;
+});
+</script>
 <script>
 (function () {
   var selected = "all";

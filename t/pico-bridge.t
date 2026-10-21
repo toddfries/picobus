@@ -390,6 +390,25 @@ if ($reg && $ws_up) {
 }
 ok($think, 'bridge forwards thinking onto hub state');
 ok($idle, 'bridge forwards idle onto hub state');
+my $type_think;
+my $type_idle;
+if ($reg && $ws_up) {
+    ok(http_post_json($port, '/emit', { typing => 'start' }), 'asked fake pico to emit typing.start');
+    for (1 .. 40) {
+        if (lab_activity(fcgi_state()) eq 'thinking') { $type_think = 1; last }
+        select undef, undef, undef, 0.1;
+    }
+    ok(http_post_json($port, '/emit', { typing => 'stop' }), 'asked fake pico to emit typing.stop');
+    for (1 .. 40) {
+        if (lab_activity(fcgi_state()) eq 'idle') { $type_idle = 1; last }
+        select undef, undef, undef, 0.1;
+    }
+} else {
+    ok(0, 'asked fake pico to emit typing.start (skipped)');
+    ok(0, 'asked fake pico to emit typing.stop (skipped)');
+}
+ok($type_think, 'typing.start marks the mate thinking');
+ok($type_idle, 'typing.stop clears thinking');
 my $hublog = read_text($log);
 ok($hublog !~ /activity/, 'forwarded activity is not a hub log line');
 
@@ -634,7 +653,7 @@ if ($up) {
 ok($heard, 'a shipmate answer is shown to the mate who asked');
 ok(!$bounced_answer, 'a shipmate answer does not start another round');
 
-if (!$got || !$got_echo || !$echo_quiet || !$dir_ok || !$pid_ok || !$todd_got || $todd_echo || !$think || !$idle || !$crew_mate || $crew_human || !$passed || $passed_raw || !$told || !$reported || !$report_back || !$asked_for || !$asked_to || !$had || !$handoff_op || $handoff_back || !$heard || $bounced_answer) {
+if (!$got || !$got_echo || !$echo_quiet || !$dir_ok || !$pid_ok || !$todd_got || $todd_echo || !$think || !$idle || !$type_think || !$type_idle || !$crew_mate || $crew_human || !$passed || $passed_raw || !$told || !$reported || !$report_back || !$asked_for || !$asked_to || !$had || !$handoff_op || $handoff_back || !$heard || $bounced_answer) {
     for my $f (qw(pico.out ws.out hub.out hub.ndjson)) {
         next unless -f "$dir/$f";
         print "--- $f ---\n";

@@ -2850,6 +2850,11 @@ body {
   width:240px; background:var(--side); display:flex;
   flex-direction:column; flex-shrink:0;
 }
+@media (max-width: 720px) {
+  .sidebar { width:116px; }
+  .brand { padding:12px 10px; }
+  .chan-label { padding-left:10px; padding-right:10px; }
+}
 .brand {
   padding:14px 16px; font-weight:700; color:var(--head);
   border-bottom:1px solid #1f2023; letter-spacing:.02em;
@@ -2898,6 +2903,7 @@ body {
 .props .close { margin-top:12px; }
 .hash { font-weight:700; color:var(--muted); }
 .dot {
+  position:relative;
   width:10px; height:10px; border-radius:50%; flex-shrink:0;
   background:var(--off);
 }
@@ -2908,18 +2914,52 @@ html[data-zhc-bucket="dev"] .dot {
 .dot.on,.dot.green { background:var(--green); }
 .dot.yellow { background:var(--yellow); }
 .dot.red { background:var(--red); }
+/* Thinking: a blue ball. Two tilted rings turn around it. */
 .dot.thinking {
-  background: repeating-linear-gradient(
-    115deg,
-    var(--green) 0 2px,
-    var(--blurple) 2px 4px
-  );
-  animation: dot-spin 0.9s linear infinite;
+  background:
+    radial-gradient(circle at 32% 30%, #e7f0ff 0 16%, transparent 17%),
+    radial-gradient(circle at 50% 55%, #7eb0ff 0 46%, #2a56c9 72%, #16327a 100%);
+  box-shadow: 0 0 5px rgba(70, 120, 220, 0.55);
+  overflow: visible;
+  z-index: 1;
 }
-.dot.thinking.hold { animation-play-state: paused; }
-@keyframes dot-spin { to { transform: rotate(360deg); } }
+.dot.thinking::before,
+.dot.thinking::after {
+  content: "";
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  box-sizing: border-box;
+  border-radius: 50%;
+  border: 1.5px solid rgba(70, 120, 220, 0.92);
+  pointer-events: none;
+}
+.dot.thinking::before {
+  width: 20px;
+  height: 7px;
+  transform: translate(-50%, -50%) rotate(-28deg);
+  animation: dot-spin 2.1s linear infinite;
+}
+.dot.thinking::after {
+  width: 24px;
+  height: 6px;
+  border-color: rgba(90, 150, 235, 0.55);
+  transform: translate(-50%, -50%) rotate(18deg);
+  animation: dot-spin-back 3s linear infinite;
+}
+.dot.thinking.hold::before,
+.dot.thinking.hold::after { animation-play-state: paused; }
+@keyframes dot-spin {
+  from { transform: translate(-50%, -50%) rotate(-28deg); }
+  to { transform: translate(-50%, -50%) rotate(332deg); }
+}
+@keyframes dot-spin-back {
+  from { transform: translate(-50%, -50%) rotate(18deg); }
+  to { transform: translate(-50%, -50%) rotate(378deg); }
+}
 @media (prefers-reduced-motion: reduce) {
-  .dot.thinking { animation: none; }
+  .dot.thinking::before,
+  .dot.thinking::after { animation: none; }
 }
 .side-foot {
   padding:10px 16px; font-size:12px; color:var(--muted);
@@ -2948,6 +2988,11 @@ html[data-zhc-bucket="dev"] .dot {
 .pager button:hover { color:var(--head); background:var(--hover); }
 .pager button.cur { color:var(--head); font-weight:700; background:var(--sel); border-radius:4px; }
 .pager button:disabled { opacity:.3; cursor:default; }
+@media (max-width: 720px) {
+  .pager { width:34px; }
+  .pager button { width:30px; }
+  .msg.mention .ts { display:none; }
+}
 /* |<-- is a left arrow; +90° points up. (was -90° = down) */
 .rot-up { transform:rotate(90deg); display:inline-block; }
 .rot-dn { transform:rotate(90deg); display:inline-block; }
@@ -2992,6 +3037,26 @@ html[data-zhc-bucket="dev"] .dot {
 .msg .body strong { font-weight:700; }
 .msg.sys { color:var(--sys); font-size:13px; }
 .msg.sys .ts { margin-left:8px; }
+.msg.mention { margin: 0 0 8px; }
+.mention-line { display:flex; align-items:center; gap:8px; min-width:0; }
+.mention-btn {
+  display: inline-flex; align-items: center; gap: 8px;
+  border: 0; background: transparent; color: var(--muted);
+  cursor: pointer; font: inherit; padding: 2px 0; max-width: 100%;
+  white-space: nowrap;
+}
+.mention-btn .who {
+  font-weight: 600; color: var(--head);
+  overflow: hidden; text-overflow: ellipsis;
+  min-width: 0;
+}
+@media (max-width: 720px) {
+  .transcript { padding-left: 8px; padding-right: 8px; }
+  .mention-line { gap: 4px; }
+  .mention-btn { gap: 4px; font-size: 13px; }
+}
+.mention-body { display: none; margin-top: 6px; }
+.msg.mention.open .mention-body { display: block; }
 .filechip {
   display:flex; align-items:center; gap:8px; flex-wrap:wrap;
   margin-top:6px; padding:6px 8px; background:#2b2d31; border-radius:6px;
@@ -3169,6 +3234,8 @@ html[data-zhc-theme="light"] #channels::-webkit-scrollbar-thumb { background:#c4
   var needLogin = __NEED_LOGIN__;
   var currentUser = null;
   var pinned = false;
+  var landed = false;
+  var openMentions = {};
   var lastAgentsRaw = "";
   var lastData = { agents: [], scores: {}, seq: 0 };
   var stateGen = 0;
@@ -3540,7 +3607,34 @@ html[data-zhc-theme="light"] #channels::-webkit-scrollbar-thumb { background:#c4
     if (channels) channels.innerHTML = html;
     if (sideFoot) sideFoot.textContent = online + " online";
   }
-  function messageHtml(m) {
+  function isMateId(id) {
+    id = String(id || "").replace(/^@/, "");
+    if (!id || id === "human" || id === "all") return false;
+    if (currentUser && id === currentUser.id) return false;
+    var agents = lastData.agents || [];
+    var i;
+    for (i = 0; i < agents.length; i++) if (agents[i].id === id) return true;
+    var chs = lastData.channels || [];
+    for (i = 0; i < chs.length; i++) {
+      if (chs[i].id === id && chs[i].kind === "dm") return true;
+    }
+    return false;
+  }
+  function isMatePing(m) {
+    var t = m.type || "";
+    if (t === "register" || t === "disconnect" || t === "error" || t === "ack") return false;
+    var to = String(m.to || "").replace(/^@/, "");
+    if (isBroadcastTo(to)) return false;
+    return isMateId(m.from) && isMateId(to);
+  }
+  function mentionKey(m) {
+    var s = String(m.ts || "") + "\n" + String(m.from || "") + "\n"
+      + String(m.to || "") + "\n" + String(m.content || "");
+    var h = 0;
+    for (var i = 0; i < s.length; i++) h = ((h << 5) - h + s.charCodeAt(i)) | 0;
+    return (h >>> 0).toString(16);
+  }
+  function messageHtml(m, chan, thinkKeys) {
     var t = m.type || "";
     if (t === "register") {
       return '<div class="msg sys">' + esc(m.id || m.from) + " online"
@@ -3556,11 +3650,25 @@ html[data-zhc-theme="light"] #channels::-webkit-scrollbar-thumb { background:#c4
     }
     var who = m.from || "unknown";
     var to = m.to || "all";
-    var dest = isBroadcastTo(to) ? "#broadcast" : "@" + to;
     var files = m.files || [];
     var chips = "";
     for (var i = 0; i < files.length; i++) chips += fileChip(files[i]);
     var body = m.content ? '<div class="body">' + renderMd(m.content) + "</div>" : "";
+    if (isMatePing(m)) {
+      var toId = String(to).replace(/^@/, "");
+      var key = mentionKey(m);
+      var label = (toId === chan) ? ("a message from " + who) : ("a message to " + toId);
+      var spinning = thinkKeys && thinkKeys[toId] === key;
+      var ball = spinning ? '<span class="dot on thinking" title="thinking"></span>' : "";
+      var open = openMentions[key] ? " open" : "";
+      return '<div class="msg mention' + open + '" data-key="' + esc(key) + '">'
+        + '<div class="mention-line"><button type="button" class="mention-btn">'
+        + ball
+        + '<span class="who">' + esc(label) + "</span></button>"
+        + '<span class="ts" title="' + esc(m.ts) + '">' + esc(fmtTs(m.ts)) + "</span></div>"
+        + '<div class="mention-body">' + body + chips + "</div></div>";
+    }
+    var dest = isBroadcastTo(to) ? "#broadcast" : "@" + to;
     var mine = who === "human" || (currentUser && who === currentUser.id);
     return '<div class="msg' + (mine ? " me" : "") + '">'
       + '<div class="meta"><span class="who">' + esc(who) + "</span>"
@@ -3673,8 +3781,15 @@ html[data-zhc-theme="light"] #channels::-webkit-scrollbar-thumb { background:#c4
       st.page = h.page || 1;
       st.seq = h.seq || 0;
       var msgs = h.messages || [];
+      var thinkKeys = {};
+      var ti;
+      for (ti = 0; ti < msgs.length; ti++) {
+        if (!isMatePing(msgs[ti])) continue;
+        var toId = String(msgs[ti].to || "").replace(/^@/, "");
+        if (activityOf(toId) === "thinking") thinkKeys[toId] = mentionKey(msgs[ti]);
+      }
       var html = "";
-      for (var i = 0; i < msgs.length; i++) html += messageHtml(msgs[i]);
+      for (var i = 0; i < msgs.length; i++) html += messageHtml(msgs[i], chan, thinkKeys);
       if (!html) html = emptyHtml(chan);
       st.el.innerHTML = html;
       notePainted(chan, msgs);
@@ -3737,6 +3852,20 @@ html[data-zhc-theme="light"] #channels::-webkit-scrollbar-thumb { background:#c4
       }
       if (!nxt && data.agents && data.agents.length) nxt = data.agents[0].id;
       if (nxt) { selectTarget(nxt, false); return; }
+    }
+    if (!pinned && !landed && selected === "all") {
+      var crew = data.agents || [];
+      var hasCaptain = false;
+      var hasZhc = false;
+      for (var zi = 0; zi < crew.length; zi++) {
+        if (crew[zi].id === "captain") hasCaptain = true;
+        if (crew[zi].id === "zhc" && crew[zi].connected) hasZhc = true;
+      }
+      if (hasCaptain && !hasZhc) {
+        landed = true;
+        selectTarget("captain", false);
+        return;
+      }
     }
     if (raw !== lastAgentsRaw || hadHold) {
       lastAgentsRaw = raw;
@@ -3878,7 +4007,29 @@ html[data-zhc-theme="light"] #channels::-webkit-scrollbar-thumb { background:#c4
       while (el && el !== pager && !el.getAttribute("data-go")) el = el.parentNode;
       if (el && el.getAttribute("data-go")) goPage(el.getAttribute("data-go"));
     });
-    if (panesRoot) panesRoot.addEventListener("click", onChipClick);
+    if (panesRoot) panesRoot.addEventListener("click", function (ev) {
+      onChipClick(ev);
+      var el = ev.target;
+      while (el && el !== panesRoot) {
+        if (el.className && String(el.className).indexOf("mention-btn") >= 0) break;
+        el = el.parentNode;
+      }
+      if (!el || el === panesRoot || !el.parentNode) return;
+      var row = el.parentNode;
+      while (row && row !== panesRoot && !(row.getAttribute && row.getAttribute("data-key"))) {
+        row = row.parentNode;
+      }
+      if (!row || row === panesRoot) return;
+      var key = row.getAttribute ? (row.getAttribute("data-key") || "") : "";
+      var cls = String(row.className || "");
+      if (cls.indexOf(" open") >= 0) {
+        row.className = cls.replace(" open", "");
+        delete openMentions[key];
+      } else {
+        row.className = cls + " open";
+        openMentions[key] = 1;
+      }
+    });
     composer.addEventListener("submit", send);
     content.addEventListener("keydown", function (e) {
       if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); }

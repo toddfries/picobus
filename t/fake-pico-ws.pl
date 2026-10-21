@@ -157,6 +157,15 @@ Mojo::IOLoop->recurring(0.1 => sub {
         }});
         return;
     }
+    if (defined $e->{typing}) {
+        my $kind = $e->{typing} eq 'stop' ? 'typing.stop' : 'typing.start';
+        $c->send({ json => {
+            type       => $kind,
+            session_id => $sid,
+            payload    => {},
+        }});
+        return;
+    }
     $c->send({ json => {
         type       => 'bus.send',
         id         => 't1',

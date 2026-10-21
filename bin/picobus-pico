@@ -437,6 +437,7 @@ sub maybe_greet {
         session_id => $sid,
         payload    => { content => $GREET_PROMPT },
     });
+    arm_thinking($agent);
     greet_clear_timer($agent);
     $agent->{greet_timer} = Mojo::IOLoop->timer($GREET_TIMEOUT => sub {
         greet_fail($agent, 'timeout');
@@ -482,6 +483,51 @@ sub hub_write {
     eval { $stream->write(encode_json($obj) . "\n") };
 }
 
+# The hub already stores thinking on the connection id. Refresh it while a
+# turn is open so a long reply does not go idle at the stale window.
+sub note_turn {
+    my ($agent, $state) = @_;
+    return unless $state eq 'thinking' || $state eq 'idle';
+    hub_write($agent, { type => 'activity', activity => $state });
+}
+
+sub arm_thinking {
+    my ($agent) = @_;
+    note_turn($agent, 'thinking');
+    # A silent gateway must not spin forever. A streaming reply extends this.
+    $agent->{think_until} = time() + 90;
+    return if $agent->{think_timer};
+    $agent->{think_timer} = Mojo::IOLoop->recurring(4 => sub {
+        if (time() > ($agent->{think_until} // 0) && !turn_open($agent)) {
+            clear_thinking($agent);
+            return;
+        }
+        note_turn($agent, 'thinking');
+    });
+}
+
+sub turn_open {
+    my ($agent) = @_;
+    my $sessions = $agent->{sessions} || {};
+    for my $sid (keys %$sessions) {
+        my $st = $sessions->{$sid} or next;
+        my $c = $st->{content} // '';
+        next unless length $c;
+        next if ($st->{flushed} // '') eq $c;
+        return 1;
+    }
+    return 0;
+}
+
+sub clear_thinking {
+    my ($agent) = @_;
+    return if turn_open($agent);
+    if (my $t = delete $agent->{think_timer}) {
+        Mojo::IOLoop->remove($t);
+    }
+    note_turn($agent, 'idle');
+}
+
 sub pico_send {
     my ($agent, $sid, $hash) = @_;
     if (my $tx = $agent->{ws}{$sid}) {
@@ -506,18 +552,26 @@ sub flush_session {
     if ($st->{echo}) {
         $st->{flushed} = $content;
         logmsg("$agent->{id} drop echo reply -> " . ($st->{from} // '') . " ($why)");
+        clear_thinking($agent);
         return;
     }
     # One introduction. Later chunks of the same turn are not a second hello.
     if ($st->{greet}) {
-        return if greet_done($agent);
+        if (greet_done($agent)) {
+            $st->{flushed} = $content;
+            clear_thinking($agent);
+            return;
+        }
         unless ($agent->{hub}) {
+            $st->{flushed} = $content;
             greet_fail($agent, 'hub down');
+            clear_thinking($agent);
             return;
         }
         if (greet_bad($content)) {
             $st->{flushed} = $content;
             greet_fail($agent, 'model');
+            clear_thinking($agent);
             return;
         }
         hub_write($agent, {
@@ -532,6 +586,7 @@ sub flush_session {
         # A failed flag write is retried on the next bridge start.
         greet_mark($agent);
         logmsg("$agent->{id} greet -> human ($why) bytes=" . length($content));
+        clear_thinking($agent);
         return;
     }
     # The roster line files the account. The model's surrounding words are
@@ -557,18 +612,31 @@ sub flush_session {
                 });
                 $st->{flushed} = $st->{content};
                 logmsg("$agent->{id} roster $rop $ralias");
+                clear_thinking($agent);
                 return;
             }
         }
         else {
             $st->{content} = strip_roster($st->{content});
-            return unless length($st->{content} // '');
+            unless (length($st->{content} // '')) {
+                $st->{flushed} = $content;
+                clear_thinking($agent);
+                return;
+            }
         }
         $content = $st->{content} // '';
-        return unless length $content;
+        unless (length $content) {
+            $st->{flushed} = $content;
+            clear_thinking($agent);
+            return;
+        }
     }
     my $to = $st->{from} // '';
-    return unless length $to;
+    unless (length $to) {
+        $st->{flushed} = $content;
+        clear_thinking($agent);
+        return;
+    }
     if ($st->{crew}) {
         # Work the operator handed across the crew is spoken for the operator.
         # The mate who passed it on gets a copy only when they asked for one.
@@ -591,6 +659,7 @@ sub flush_session {
             }
             $st->{flushed} = $content;
             logmsg("$agent->{id} reply -> operator ($why) bytes=" . length($content));
+            clear_thinking($agent);
             return;
         }
         # A shipmate asked. The answer goes to that shipmate. reply stops
@@ -604,6 +673,7 @@ sub flush_session {
         });
         $st->{flushed} = $content;
         logmsg("$agent->{id} reply -> $to ($why) bytes=" . length($content));
+        clear_thinking($agent);
         return;
     }
     hub_write($agent, {
@@ -615,6 +685,7 @@ sub flush_session {
     });
     $st->{flushed} = $content;
     logmsg("$agent->{id} reply -> $to ($why) bytes=" . length($content));
+    clear_thinking($agent);
 }
 
 sub mate_label {
@@ -714,12 +785,18 @@ sub handle_pico {
         greet_fail($agent, 'pico') if $sid ne '' && $sid eq greet_sid($agent);
         return;
     }
+    if ($type eq 'typing.start') {
+        arm_thinking($agent);
+        return;
+    }
     if ($type eq 'typing.stop') {
         flush_session($agent, $sid, 'typing.stop') if $sid;
+        clear_thinking($agent);
         return;
     }
     return unless $type eq 'message.create' || $type eq 'message.update';
     my $pl = $msg->{payload} || {};
+    arm_thinking($agent);
     return if thoughtish($pl);
     my $content = $pl->{content} // '';
     return unless length $content;
@@ -855,6 +932,7 @@ sub handle_hub_line {
             . "That line files the account. Words alone do not. "
             . "A list is not how they join.";
     }
+    arm_thinking($agent) unless $st->{echo};
     # Pico binds the WS connection to ?session_id=; replies go only to
     # connections in that session. Message session_id must match.
     pico_send($agent, $sid, {

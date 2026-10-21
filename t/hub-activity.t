@@ -25,6 +25,9 @@ if (open my $sf, '<', $bin) {
 }
 ok($src =~ /setInterval\(tick, 1500\)/, 'roster poll stays at 1.5s');
 ok($src =~ /dot-spin/ && $src =~ /prefers-reduced-motion/, 'thinking ball is CSS, and reduced motion is static');
+ok($src =~ /dot\.thinking::before/ && $src =~ /dot-spin-back/, 'thinking is a blue ball with a turning ring');
+ok($src =~ /selectTarget\("captain"/, 'a fresh visit opens the captain channel');
+ok($src =~ /a message from /, 'a mate-to-mate line collapses to a mention');
 ok($src =~ /data-zhc-bucket/ && $src =~ /html\[data-zhc-bucket="dev"\] \.dot/ && $src =~ /calc\(10px \* 1\.75\)/, 'dev ball is 75% larger; other buckets stay 10px');
 ok($src =~ /holdFor\[a\.id\] === stateGen/, 'a new message pauses the ball only until the next poll');
 ok($src =~ /if \(first \|\| prev === key\) continue/, 'the first history paint does not pause the ball');
